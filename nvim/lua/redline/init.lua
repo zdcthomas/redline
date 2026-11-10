@@ -916,7 +916,7 @@ function M.help()
       { p .. 't', 'thread list, as a buffer' },
       { p .. 'o', 'open the thread at the cursor as a buffer' },
       { p .. 'h', 'history of events' },
-      { ':Redline style', 'next comment style: bg, brackets, carets' },
+      { p .. 's', 'next comment style: bg, brackets, carets' },
       { 'WRITE' },
       { ':w', 'a save records your edit' },
       { 'u', 'undo, also for an accept' },
@@ -1045,6 +1045,7 @@ function M.attach()
     map('n', p .. 't', M.threads, 'thread list')
     map('n', p .. 'o', function() M.thread() end, 'open the thread as a buffer')
     map('n', p .. 'h', M.history, 'history')
+    map('n', p .. 's', function() M.style() end, 'next comment style')
   end
   vim.keymap.set('n', 'g?', M.help, { buffer = buf, desc = 'redline: show the keys' })
   M.refresh()
