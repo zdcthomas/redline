@@ -1,0 +1,256 @@
+<title>redline prototype</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,700;1,400&family=Space+Grotesk:wght@500;700&display=swap">
+<style>
+/* Layout: one terminal window, centered, with a short caption above and touch keys below. Single dark look by choice: it is a terminal. */
+:root {
+  color-scheme: dark;
+  --page: #0e0f14; --term: #14161d; --bar: #181a22; --line: #3e4456;
+  --text: #d6dce8; --dim: #6c748a; --faint: #3e4456;
+  --accent: #ff5c57; --add: #82d68c; --add-bg: #1c3626; --del: #f0787c; --del-bg: #401e24;
+  --note: #f0c674; --note-bg: #3a3218; --note-bg-on: #62521e;
+  --agent: #bb9af7; --human: #7aa2f7; --code: #89c9d6; --h2: #ffaa6e;
+  --cursor-bg: #222632; --select-bg: #303a58;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --display: "Space Grotesk", system-ui, sans-serif;
+}
+html, body { background: var(--page); color: var(--text); }
+body { font-family: var(--mono); padding-block: 28px 40px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
+h1 { font: 700 30px/1 var(--display); margin: 0; color: var(--accent); letter-spacing: -0.02em; }
+header p { margin: 0; color: var(--dim); font-size: 13px; max-width: 65ch; }
+header b { color: var(--text); font-weight: 400; }
+.term { background: var(--term); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; font-size: 13px; line-height: 1.55; position: relative; outline: none; }
+.term:focus-visible { border-color: var(--accent); }
+.top, .status { background: var(--bar); display: flex; gap: 14px; padding: 2px 8px; white-space: nowrap; overflow: hidden; }
+.top .name { color: var(--accent); font-weight: 700; } .top .file { font-weight: 700; } .top .dir, .top .count { color: var(--dim); } .top .count { margin-left: auto; }
+.body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 380px); height: 520px; }
+.doc, .side, .hist { overflow-y: auto; min-width: 0; scrollbar-width: thin; scrollbar-color: var(--faint) transparent; }
+.side { border-left: 1px solid var(--faint); padding: 2px 0; }
+.row { display: grid; grid-template-columns: 3ch 1.4ch 1.6ch minmax(0, 1fr); padding: 0 8px 0 4px; }
+.row.cur { background: var(--cursor-bg); } .row.sel { background: var(--select-bg); }
+.num { color: var(--faint); text-align: right; } .cur .num { color: var(--text); font-weight: 700; }
+.barc { color: #96464a; text-align: center; } .cur .barc { color: var(--accent); }
+.txt { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 1.55em; }
+.h1 { color: var(--accent); font-weight: 700; } .h2 { color: var(--h2); font-weight: 700; } .mk { color: var(--accent); font-weight: 700; }
+code { font: inherit; color: var(--code); }
+del { color: var(--del); } ins { color: var(--add); text-decoration: none; } mark { background: var(--note-bg); color: inherit; }
+.on del { background: var(--del-bg); } .on ins { background: var(--add-bg); font-weight: 700; } .on mark { background: var(--note-bg-on); }
+.k-comment { color: var(--note); } .k-edit { color: var(--h2); } .k-insert { color: var(--add); } .k-delete { color: var(--del); }
+.sidehead { color: var(--dim); padding: 0 10px 6px; } .sidehead b { letter-spacing: 0.06em; }
+.card { border-left: 2px solid var(--faint); margin: 0 8px 12px 10px; padding: 0 8px; }
+.card.on { background: var(--cursor-bg); border-left-color: currentColor; }
+.card > * { color: var(--text); overflow-wrap: anywhere; }
+.card .hd { display: flex; gap: 8px; flex-wrap: wrap; } .card .hd .at { margin-left: auto; color: var(--dim); }
+.card .quote { color: var(--dim); font-style: italic; } .card .hint, .dimt { color: var(--dim); }
+.agent { color: var(--agent); } .human { color: var(--human); }
+.status .pill { background: var(--accent); color: #121218; font-weight: 700; padding: 0 8px; margin-left: -8px; }
+.status .pos, .status .hintline { color: var(--dim); } .status .msg { color: var(--text); }
+.hist { grid-column: 1 / -1; padding: 8px 12px; }
+.ev { display: grid; grid-template-columns: 7ch 9ch minmax(0, 1fr); gap: 0 10px; margin-bottom: 6px; }
+.ev .t { color: var(--dim); } .ev .d { grid-column: 3; color: var(--dim); white-space: pre-wrap; }
+.pop { position: absolute; background: var(--term); border: 1px solid var(--accent); border-radius: 8px; display: flex; flex-direction: column; }
+.pop .ttl { color: var(--accent); font-weight: 700; padding: 0 10px; margin-top: -0.85em; align-self: flex-start; background: var(--term); margin-left: 10px; }
+.pop .foot { color: var(--dim); padding: 2px 10px 4px; font-size: 12px; }
+.pop textarea, .pop input { flex: 1; background: transparent; color: var(--text); border: 0; outline: 0; font: inherit; padding: 6px 12px; resize: none; min-width: 0; }
+#editor { inset: 12% 6%; } #ask { left: 8%; right: 8%; bottom: 44px; border-color: var(--note); } #ask .ttl { color: var(--note); }
+#help { inset: 8% 14%; border-color: var(--faint); padding: 6px 4px; overflow: auto; } #help div { display: grid; grid-template-columns: 16ch minmax(0, 1fr); padding: 0 12px; } #help .sec { color: var(--accent); font-weight: 700; display: block; } #help span { color: var(--dim); }
+.keys { display: flex; flex-wrap: wrap; gap: 8px; }
+.keys button { font: inherit; font-size: 13px; background: var(--bar); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+.keys button:hover, .keys button:focus-visible { border-color: var(--accent); outline: none; }
+.keys button span { color: var(--dim); }
+.note { color: var(--dim); font-size: 12px; margin: 0; max-width: 80ch; }
+@media (max-width: 760px) { .body { grid-template-columns: minmax(0, 1fr); height: auto; } .doc { height: 340px; } .side { border-left: 0; border-top: 1px solid var(--faint); height: 260px; } .hist { height: 600px; } .term { font-size: 12px; } #editor { inset: 6% 3%; } #help { inset: 3%; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>redline</h1>
+    <p>Prototype of the TUI. <b>You write the spec; the agent can only suggest.</b> Click the terminal, then use the keys. This page imitates the real program, which runs in your terminal and opens your own editor.</p>
+  </header>
+
+  <div class="term" id="term" tabindex="0" aria-label="redline terminal prototype">
+    <div class="top"><span class="name">▌redline</span><span class="file">payments-api.md</span><span class="dir">~/specs</span><span class="count" id="count"></span></div>
+    <div class="body" id="body"></div>
+    <div class="status"><span class="pill" id="pill">NORMAL</span><span class="pos" id="pos"></span><span id="statusmsg" class="hintline"></span></div>
+
+    <div class="pop" id="editor" hidden>
+      <span class="ttl" id="edttl"></span>
+      <textarea id="edtext" spellcheck="false" aria-label="editor"></textarea>
+      <div class="foot">This box stands in for your editor (nvim, helix, …). ctrl-enter: save and quit · esc: cancel</div>
+    </div>
+    <div class="pop" id="ask" hidden>
+      <span class="ttl" id="askttl"></span>
+      <input id="asktext" autocomplete="off" aria-label="text">
+      <div class="foot">⏎ save · esc cancel</div>
+    </div>
+    <div class="pop" id="help" hidden></div>
+  </div>
+
+  <div class="keys" id="keys" aria-label="keys"></div>
+  <p class="note">Sample data. In the real program the agent adds threads with <code>redline propose</code> and <code>redline comment</code>, and reads your decisions with <code>redline wait</code>. Press <code>p</code> here to simulate a new proposal from the agent.</p>
+</div>
+
+<script>
+const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+let doc = `# Payments API spec
+
+## Goals
+
+The service accepts card payments and returns a result in less than 2 seconds.
+It must be idempotent: a retry with the same key must not charge twice.
+
+## Non-goals
+
+- Refunds
+- Multi-currency settlement
+
+## Endpoints
+
+\`POST /v1/charges\` creates a charge. The body holds \`amount\`, \`currency\` and \`source\`.
+
+## Open questions
+
+- Do we need webhooks in v1?
+- Which rate limit applies per merchant?`.split('\n');
+let nextId = 5, cursor = 4, active = 1, sel = null, view = 'doc', flash = '', undoStack = [], pending = '';
+let threads = [
+  { id: 1, kind: 'edit', line: 4, quote: 'less than 2 seconds', neu: 'less than 800 ms at p99', body: 'A latency target needs a percentile.', author: 'claude', agent: true, replies: [] },
+  { id: 2, kind: 'comment', line: 5, quote: 'idempotent', body: 'How long do we keep idempotency keys?', author: 'claude', agent: true, replies: [] },
+  { id: 3, kind: 'insert', line: 10, neu: '- Disputes and chargebacks', body: 'Teams often assume that this is in scope.', author: 'claude', agent: true, replies: [] },
+  { id: 4, kind: 'delete', line: 18, quote: '- Do we need webhooks in v1?', body: 'The kickoff decided: no webhooks in v1.', author: 'claude', agent: true, replies: [] },
+];
+let history = threads.map(t => ({ who: 'claude', agent: true, head: (t.kind === 'comment' ? 'commented' : 'proposed ' + t.kind) + ' #' + t.id + ' at L' + (t.line + 1), detail: t.body }));
+const icon = { comment: '●', edit: '~', insert: '+', delete: '−' };
+const $ = id => document.getElementById(id);
+const log = (head, detail = '', who = 'you', agent = false) => history.push({ who, agent, head, detail });
+const open = () => threads.slice().sort((a, b) => a.line - b.line || a.id - b.id);
+const cur = () => threads.find(t => t.id === active);
+function block(l) { if (!doc[l] || !doc[l].trim()) return null; let a = l, b = l; while (a > 0 && doc[a - 1].trim()) a--; while (b < doc.length - 1 && doc[b + 1].trim()) b++; return [a, b]; }
+function target() { return sel !== null ? [Math.min(sel, cursor), Math.max(sel, cursor)] : block(cursor); }
+function shift(from, by) { threads.forEach(t => { if (t.line >= from) t.line += by; }); }
+function snapshot(reopen) { undoStack.push({ doc: doc.slice(), threads: JSON.parse(JSON.stringify(threads)), cursor, reopen }); }
+function syncActive() { const here = threads.filter(t => t.line === cursor); if (!here.some(t => t.id === active)) active = here.length ? here[0].id : null; }
+function move(l) { cursor = Math.max(0, Math.min(doc.length - 1, l)); syncActive(); }
+
+function md(line) {
+  let h = esc(line).replace(/`([^`]*)`/g, '<code>`$1`</code>');
+  if (/^# /.test(line)) return `<span class="h1">${h}</span>`;
+  if (/^##+ /.test(line)) return `<span class="h2">${h}</span>`;
+  return h.replace(/^(- |\d+\. )/, '<span class="mk">$1</span>');
+}
+function lineHtml(i) {
+  let html = null;
+  for (const t of threads.filter(t => t.line === i)) {
+    const on = t.id === active ? ' class="on"' : '';
+    if (t.kind === 'delete') html = `<span${on}><del>${esc(doc[i])}</del></span>`;
+    else if (t.quote && doc[i].includes(t.quote) && html === null) {
+      const [a, b] = doc[i].split(t.quote, 2).length === 2 ? [doc[i].slice(0, doc[i].indexOf(t.quote)), doc[i].slice(doc[i].indexOf(t.quote) + t.quote.length)] : [doc[i], ''];
+      const mid = t.kind === 'edit' ? `<del>${esc(t.quote)}</del><ins>${esc(t.neu)}</ins>` : `<mark>${esc(t.quote)}</mark>`;
+      html = `${md(a)}<span${on}>${mid}</span>${md(b)}`;
+    }
+  }
+  html = html === null ? md(doc[i]) : html;
+  for (const t of threads.filter(t => t.line === i && t.kind === 'insert'))
+    html += `\n<span${t.id === active ? ' class="on"' : ''}><ins>${esc(t.neu)}</ins></span>`;
+  return html;
+}
+function card(t) {
+  const on = t.id === active;
+  let h = `<div class="card k-${t.kind}${on ? ' on' : ''}" data-id="${t.id}"><div class="hd"><b class="k-${t.kind}">#${t.id} ${icon[t.kind]} ${t.kind}</b><span class="${t.agent ? 'agent' : 'human'}">${t.author}</span><span class="at">L${t.line + 1}</span></div>`;
+  if (t.kind === 'comment') h += `<div class="quote">“${esc(t.quote.length > 60 ? t.quote.slice(0, 60) + ' …' : t.quote)}”</div>`;
+  if (t.kind === 'edit' || t.kind === 'delete') h += `<div><del>− ${esc(t.quote)}</del></div>`;
+  if (t.kind === 'edit' || t.kind === 'insert') h += `<div><ins>+ ${esc(t.neu)}</ins></div>`;
+  h += `<div>${esc(t.body)}</div>`;
+  for (const r of t.replies) h += `<div><span class="dimt">↳ </span><span class="${r.agent ? 'agent' : 'human'}">${r.who}</span>: ${esc(r.body)}</div>`;
+  if (on) h += `<div class="hint">${t.kind === 'comment' ? 'r reply · R resolve' : 'a accept · x reject · m modify · r reply'}</div>`;
+  return h + '</div>';
+}
+function render() {
+  const body = $('body'), tg = target();
+  if (view === 'hist') {
+    body.innerHTML = '<div class="hist">' + history.slice().reverse().map(e => `<div class="ev"><span class="t">now</span><b class="${e.agent ? 'agent' : 'human'}">${e.who}</b><span>${esc(e.head)}</span>${e.detail ? `<span class="d">${esc(e.detail)}</span>` : ''}</div>`).join('') + '</div>';
+  } else {
+    const rows = doc.map((l, i) => {
+      const ts = threads.filter(t => t.line === i), t = ts.find(t => t.id === active) || ts[0];
+      const inSel = sel !== null && i >= Math.min(sel, cursor) && i <= Math.max(sel, cursor);
+      const bar = i === cursor ? '▌' : tg && i >= tg[0] && i <= tg[1] ? '▏' : '';
+      return `<div class="row${i === cursor ? ' cur' : ''}${inSel ? ' sel' : ''}" data-l="${i}"><span class="num">${i + 1}</span><span class="barc">${bar}</span><span class="${t ? 'k-' + t.kind : ''}">${t ? icon[t.kind] : ''}</span><span class="txt">${lineHtml(i)}</span></div>`;
+    }).join('');
+    const list = open();
+    const side = `<div class="sidehead"><b>THREADS</b>  ${list.length} open</div>` + (list.length ? list.map(card).join('') : '<div class="sidehead">No open threads.<br><br>c  comment on the block<br>p  simulate an agent proposal</div>');
+    body.innerHTML = `<div class="doc">${rows}</div><div class="side">${side}</div>`;
+    body.querySelector('.row.cur')?.scrollIntoView({ block: 'nearest' });
+    const oc = body.querySelector('.card.on'); if (oc) body.querySelector('.side').scrollTop = Math.max(0, oc.offsetTop - 60);
+  }
+  $('count').textContent = `${threads.length} open · ${history.filter(e => /^(accepted|rejected|resolved)/.test(e.head)).length} decided`;
+  $('pill').textContent = !$('editor').hidden ? 'EDITOR' : !$('ask').hidden ? 'WRITE' : view === 'hist' ? 'HISTORY' : sel !== null ? 'SELECT' : 'NORMAL';
+  $('pos').textContent = `L${cursor + 1}/${doc.length}`;
+  const t = cur(), m = $('statusmsg');
+  m.className = flash ? 'msg' : 'hintline';
+  m.textContent = flash || (view === 'hist' ? 'H or q: back' : sel !== null ? 'e edit lines · c comment · d delete · esc cancel' : t && t.kind !== 'comment' ? 'a accept · x reject · m modify · r reply · n next thread' : t ? 'r reply · R resolve · n next thread' : 'e edit block · o new block · c comment · v select · n next thread · ? help');
+}
+
+function stepThread(d) { const o = open(); if (!o.length) { flash = 'no open threads'; return; } let i = o.findIndex(t => t.id === active); i = i < 0 ? (d > 0 ? 0 : o.length - 1) : (i + d + o.length) % o.length; active = o[i].id; cursor = o[i].line; sel = null; }
+function drop(id) { threads = threads.filter(t => t.id !== id); syncActive(); }
+function accept(t, changed) {
+  snapshot(t.id);
+  if (changed !== undefined) t.neu = changed;
+  if (t.kind === 'edit') doc[t.line] = doc[t.line].replace(t.quote, t.neu);
+  if (t.kind === 'insert') { doc.splice(t.line + 1, 0, ...t.neu.split('\n')); const n = t.neu.split('\n').length; threads.forEach(o => { if (o.line > t.line) o.line += n; }); }
+  if (t.kind === 'delete') { doc.splice(t.line, 1); threads.forEach(o => { if (o.line > t.line) o.line -= 1; }); }
+  log(`accepted #${t.id}${changed !== undefined ? ' with changes' : ''}`, changed !== undefined ? '+ ' + changed : '');
+  const l = t.line; drop(t.id); move(Math.min(l, doc.length - 1)); flash = `accepted #${t.id}  ·  u to undo`;
+}
+function editor(title, text, done) { $('edttl').textContent = ` nvim · ${title} `; $('edtext').value = text; $('editor').hidden = false; $('edtext').focus(); $('editor').done = done; }
+function ask(title, done) { $('askttl').textContent = ` ${title} `; $('asktext').value = ''; $('ask').hidden = false; $('asktext').focus(); $('ask').done = done; }
+function closePop(id, value) { const el = $(id), done = el.done; el.hidden = true; $('term').focus(); if (value !== null && done) done(value); render(); }
+function replaceLines(a, b, lines) { snapshot(); const old = doc.slice(a, b + 1).join('\n'); doc.splice(a, b - a + 1, ...lines); const d = lines.length - (b - a + 1); threads.forEach(t => { if (t.line > b) t.line += d; else if (t.line >= a) { t.line = Math.min(t.line, a + lines.length - 1); if (t.quote && !doc[t.line].includes(t.quote)) { if (t.kind === 'comment') t.quote = doc[t.line]; } } }); if (!doc.length) doc = ['']; log(`edited the document at L${a + 1}`, '- ' + old.split('\n').join('\n- ') + '\n+ ' + lines.join('\n+ ')); }
+
+function key(k, ctrl) {
+  flash = '';
+  if (!$('help').hidden) { $('help').hidden = true; return render(); }
+  if (view === 'hist') { if (k === 'H' || k === 'q' || k === 'Escape') view = 'doc'; return render(); }
+  const p = pending; pending = ''; const t = cur(), tg = target();
+  const need = () => { if (!t) flash = 'no thread here  ·  n goes to the next thread'; return t; };
+  if (k === 'j' || k === 'ArrowDown') move(cursor + 1);
+  else if (k === 'k' || k === 'ArrowUp') move(cursor - 1);
+  else if (k === 'd' && ctrl) move(cursor + 8); else if (k === 'u' && ctrl) move(cursor - 8);
+  else if (k === 'G') move(doc.length - 1);
+  else if (k === 'g') { if (p === 'g') move(0); else pending = 'g'; }
+  else if (k === '}') { let l = cursor; while (l < doc.length - 1 && doc[l].trim()) l++; while (l < doc.length - 1 && !doc[l].trim()) l++; move(l); }
+  else if (k === '{') { let l = cursor; while (l > 0 && doc[l].trim()) l--; while (l > 0 && !doc[l].trim()) l--; const b = block(l); move(b ? b[0] : 0); }
+  else if (k === 'n' || k === ']') stepThread(1); else if (k === 'N' || k === '[') stepThread(-1);
+  else if (k === 'Tab') { const h = threads.filter(x => x.line === cursor); if (h.length) active = h[(h.findIndex(x => x.id === active) + 1) % h.length].id; }
+  else if (k === 'v') sel = sel === null ? cursor : null;
+  else if (k === 'Escape') sel = null;
+  else if (k === 'a') { if (need()) t.kind === 'comment' ? flash = 'a comment has nothing to accept: R resolves it' : accept(t); }
+  else if (k === 'm') { if (need()) (t.kind === 'edit' || t.kind === 'insert') ? editor(`change #${t.id}, then accept`, t.neu, v => v.trim() && accept(t, v.trim())) : flash = 'only an edit or an insert has text to change'; }
+  else if (k === 'x') { if (need()) t.kind === 'comment' ? flash = 'R resolves a comment' : ask(`Reject #${t.id}: reason (optional, the agent reads it)`, v => { log(`rejected #${t.id}`, v); drop(t.id); flash = `rejected #${t.id}`; }); }
+  else if (k === 'R') { if (need()) t.kind !== 'comment' ? flash = 'a proposal needs a decision: a accept, x reject' : (log(`resolved #${t.id}`), drop(t.id), flash = `resolved #${t.id}`); }
+  else if (k === 'r') { if (need()) ask(`Reply on #${t.id}`, v => { if (v.trim()) { t.replies.push({ who: 'you', body: v.trim() }); log(`replied on #${t.id}`, v.trim()); } }); }
+  else if (k === 'c') { if (!tg) flash = 'no text to comment on'; else ask(`Comment on L${tg[0] + 1}${tg[1] > tg[0] ? '–' + (tg[1] + 1) : ''}`, v => { if (!v.trim()) return; const id = nextId++; threads.push({ id, kind: 'comment', line: tg[0], quote: doc[tg[0]], body: v.trim(), author: 'you', agent: false, replies: [] }); log(`commented #${id} on L${tg[0] + 1}`, v.trim()); active = id; sel = null; flash = `comment #${id} added`; }); }
+  else if (k === 'e' || k === 'Enter') { if (!tg) flash = 'blank line: o adds a new block'; else editor(`L${tg[0] + 1}${tg[1] > tg[0] ? '–' + (tg[1] + 1) : ''}`, doc.slice(tg[0], tg[1] + 1).join('\n'), v => { const lines = v.replace(/\s+$/, '').split('\n'); if (lines.join('\n') === doc.slice(tg[0], tg[1] + 1).join('\n')) { flash = 'no change'; return; } replaceLines(tg[0], tg[1], lines); sel = null; move(tg[0]); flash = 'saved  ·  u to undo'; }); }
+  else if (k === 'o' || k === 'O') { const at = k === 'o' ? (tg ? tg[1] : cursor) + 1 : (tg ? tg[0] : cursor); editor('new block', '', v => { const lines = v.replace(/\s+$/, '').split('\n'); if (!lines.join('').trim()) { flash = 'empty block: nothing added'; return; } snapshot(); const add = k === 'o' ? ['', ...lines] : [...lines, '']; doc.splice(at, 0, ...add); shift(at, add.length); log(`added a block at L${at + 1}`, '+ ' + lines.join('\n+ ')); move(k === 'o' ? at + 1 : at); flash = 'block added  ·  u to undo'; }); }
+  else if (k === 'd') { if (sel !== null || p === 'd') { if (!tg) flash = 'nothing to delete here'; else { snapshot(); const n = tg[1] - tg[0] + 1; log(`deleted text at L${tg[0] + 1}`, '- ' + doc.slice(tg[0], tg[1] + 1).join('\n- ')); doc.splice(tg[0], n); threads = threads.filter(x => x.line < tg[0] || x.line > tg[1]); threads.forEach(x => { if (x.line > tg[1]) x.line -= n; }); if (!doc.length) doc = ['']; sel = null; move(tg[0]); flash = `deleted ${n} lines  ·  u to undo`; } } else pending = 'd'; }
+  else if (k === 'u') { const s = undoStack.pop(); if (!s) flash = 'nothing to undo'; else { doc = s.doc; threads = s.threads; cursor = s.cursor; if (s.reopen) log(`reopened #${s.reopen} (undo)`); else log('undid a change'); syncActive(); flash = 'undone'; } }
+  else if (k === 'p') { const l = doc.findIndex(x => x.includes('rate limit')); const id = nextId++; if (l >= 0 && !threads.some(x => x.line === l)) { threads.push({ id, kind: 'edit', line: l, quote: 'Which rate limit applies per merchant?', neu: 'Rate limit: 100 requests per second per merchant.', body: 'The gateway default. Change the number if you know better.', author: 'claude', agent: true, replies: [] }); log(`proposed edit #${id} at L${l + 1}`, 'The gateway default.', 'claude', true); flash = `new: edit #${id} from claude  ·  n to go there`; } else { const b = doc.findIndex(x => /^# /.test(x)); threads.push({ id, kind: 'comment', line: Math.max(b, 0), quote: doc[Math.max(b, 0)], body: 'Should the title name the API version?', author: 'claude', agent: true, replies: [] }); log(`commented #${id} on L${Math.max(b, 0) + 1}`, 'Should the title name the API version?', 'claude', true); flash = `new: comment #${id} from claude  ·  n to go there`; } }
+  else if (k === 'H') view = 'hist';
+  else if (k === '?') $('help').hidden = false;
+  else return false;
+  render(); return true;
+}
+
+$('help').innerHTML = [['', 'MOVE'], ['j k', 'line down / up'], ['{ }', 'previous / next block'], ['gg  G', 'top / bottom'], ['n N', 'next / previous thread'], ['', 'WRITE (opens your editor)'], ['e  enter', 'edit the block or the selected lines'], ['o O', 'new block below / above'], ['v', 'select lines'], ['dd', 'delete the block'], ['u', 'undo'], ['', 'REVIEW'], ['a', 'accept the proposal'], ['m', 'modify, then accept'], ['x', 'reject, with a reason'], ['c', 'comment'], ['r  R', 'reply / resolve'], ['', 'OTHER'], ['H', 'history'], ['p', 'simulate an agent proposal (prototype only)']].map(([k, d]) => k ? `<div><b>${esc(k)}</b><span>${d}</span></div>` : `<div class="sec">${d}</div>`).join('');
+$('term').addEventListener('keydown', e => {
+  if (e.target.id === 'edtext') { if (e.key === 'Escape') { e.preventDefault(); closePop('editor', null); } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); closePop('editor', e.target.value); } return; }
+  if (e.target.id === 'asktext') { if (e.key === 'Escape') { e.preventDefault(); closePop('ask', null); } else if (e.key === 'Enter') { e.preventDefault(); closePop('ask', e.target.value); } return; }
+  if (e.metaKey || e.altKey) return;
+  if (key(e.key, e.ctrlKey)) e.preventDefault();
+});
+$('body').addEventListener('click', e => { const r = e.target.closest('.row'), c = e.target.closest('.card'); if (r) move(+r.dataset.l); if (c) { active = +c.dataset.id; cursor = cur().line; } if (r || c) render(); });
+$('keys').innerHTML = [['j', 'down'], ['k', 'up'], ['n', 'next thread'], ['a', 'accept'], ['x', 'reject'], ['m', 'modify'], ['c', 'comment'], ['r', 'reply'], ['R', 'resolve'], ['e', 'edit block'], ['o', 'new block'], ['u', 'undo'], ['p', 'agent proposes'], ['H', 'history'], ['?', 'help']].map(([k, d]) => `<button type="button" data-k="${k}"><b>${k}</b> <span>${d}</span></button>`).join('');
+$('keys').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { key(b.dataset.k, false); if ($('editor').hidden && $('ask').hidden) $('term').focus({ preventScroll: true }); } });
+render();
+</script>
