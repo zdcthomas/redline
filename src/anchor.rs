@@ -21,6 +21,13 @@ pub fn line_of(doc: &str, pos: usize) -> usize {
         .count()
 }
 
+/// (0-based line, byte column) of byte `pos`.
+pub fn pos(doc: &str, pos: usize) -> (usize, usize) {
+    let pos = pos.min(doc.len());
+    let start = doc[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    (line_of(doc, pos), pos - start)
+}
+
 /// Byte range of lines `l0..=l1`, without the final newline.
 pub fn lines_range(doc: &str, l0: usize, l1: usize) -> Range<usize> {
     let ls = line_starts(doc);

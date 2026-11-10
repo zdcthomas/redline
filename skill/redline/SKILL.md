@@ -5,7 +5,7 @@ description: Use when the user works on a spec or design document with redline (
 
 # redline
 
-redline is a spec editor. The human owns the document and edits it in a TUI.
+redline is a spec editor. The human owns the document and edits it in their editor or in the redline TUI.
 You are a reviewer: you **propose** changes and **comment**. The human accepts
 or rejects each proposal. Every proposal, comment and decision goes into a
 history in `~/.redline/`.
@@ -63,5 +63,7 @@ redline wait FILE [--timeout 300]
   line with no blank lines (list items, table rows). `--after-line 0` is the top.
 - `--as NAME` (or `$REDLINE_AUTHOR`) sets your name in the history. Default: `agent`.
 - `--json` on `show`, `threads`, `log` and `wait` gives machine-readable output.
-- You cannot accept, reject, resolve or edit. Those are human actions in the TUI.
-- If the human is not in the TUI yet, tell them to run `redline FILE`.
+- `accept`, `reject`, `resolve`, `reopen` and `sync` are human verbs. They need `--human`,
+  which only the human's editor or TUI passes. Never pass `--human` or set `REDLINE_ROLE`.
+- If the human does not see your threads, tell them to run `redline FILE` (TUI) or
+  `:Redline` (Neovim).

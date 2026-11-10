@@ -31,12 +31,21 @@ impl App {
         let [doc, side] = Layout::horizontal([Constraint::Min(10), Constraint::Length(side_w)]).areas(body);
         self.page = body.height as usize;
         self.draw_top(f, top);
-        if self.mode == Mode::History {
-            self.draw_history(f, body);
-        } else {
-            self.draw_doc(f, doc);
-            if side_w > 0 {
-                self.draw_side(f, side);
+        match self.mode {
+            Mode::History => self.draw_history(f, body),
+            // On a narrow screen the thread list takes the full width.
+            Mode::Threads if side_w == 0 => self.draw_side(f, body),
+            Mode::Thread => {
+                self.draw_thread(f, if side_w == 0 { body } else { doc });
+                if side_w > 0 {
+                    self.draw_side(f, side);
+                }
+            }
+            _ => {
+                self.draw_doc(f, doc);
+                if side_w > 0 {
+                    self.draw_side(f, side);
+                }
             }
         }
         self.draw_status(f, status);
@@ -135,7 +144,9 @@ impl App {
         }
     }
 
-    fn card(&self, t: &Thread, w: usize, active: bool) -> Vec<Line<'static>> {
+    /// The lines of one thread. `full` shows all text; a card clips it.
+    fn card(&self, t: &Thread, w: usize, active: bool, full: bool) -> Vec<Line<'static>> {
+        let cap = |n: usize| if full { usize::MAX } else { n };
         let kc = kind_color(t.kind);
         let bar = Span::styled("▎", if active { fg(kc) } else { fg(FAINT) });
         let mut out: Vec<Line<'static>> = vec![];
@@ -159,7 +170,7 @@ impl App {
             Span::raw(" ".repeat(pad)),
             Span::styled(place, if self.ix.thread_line.contains_key(&t.id) { fg(DIM) } else { fg(DEL) }),
         ]);
-        let max = if active { 10 } else { 2 };
+        let max = cap(if active { 10 } else { 2 });
         let diff = |sign: &str, text: &str, c: Color, strike: bool| -> Vec<Vec<Span<'static>>> {
             clip(wrap_str(text, w.saturating_sub(2)), max)
                 .into_iter()
@@ -173,7 +184,7 @@ impl App {
                 .collect()
         };
         let rows = match t.kind {
-            Kind::Comment => clip(wrap_str(&t.quote, w.saturating_sub(2)), if active { 3 } else { 1 })
+            Kind::Comment => clip(wrap_str(&t.quote, w.saturating_sub(2)), cap(if active { 3 } else { 1 }))
                 .into_iter()
                 .map(|l| vec![Span::styled(format!("“{l}”"), fg(DIM).add_modifier(Modifier::ITALIC))])
                 .collect(),
@@ -186,12 +197,12 @@ impl App {
             Kind::Delete => diff("−", &t.quote, DEL, true),
         };
         rows.into_iter().for_each(&mut push);
-        for l in clip(wrap_str(&t.body, w), if active { 12 } else { 3 }) {
+        for l in clip(wrap_str(&t.body, w), cap(if active { 12 } else { 3 })) {
             push(vec![Span::styled(l, fg(TEXT))]);
         }
         for r in &t.replies {
             let c = if r.agent { AGENT } else { HUMAN };
-            let lines = clip(wrap_str(&format!("{}: {}", r.author, r.body), w.saturating_sub(2)), if active { 12 } else { 2 });
+            let lines = clip(wrap_str(&format!("{}: {}", r.author, r.body), w.saturating_sub(2)), cap(if active { 12 } else { 2 }));
             for (i, l) in lines.into_iter().enumerate() {
                 let lead = if i == 0 { "↳ " } else { "  " };
                 let n = if i == 0 { r.author.len().min(l.len()) } else { 0 };
@@ -200,7 +211,9 @@ impl App {
             }
         }
         if active {
-            let hint = if t.kind.is_proposal() {
+            let hint = if full {
+                ""
+            } else if t.kind.is_proposal() {
                 "a accept · x reject · m modify · r reply"
             } else {
                 "r reply · R resolve"
@@ -217,9 +230,11 @@ impl App {
         }
         let inner = Rect::new(area.x + 1, area.y, area.width - 1, area.height);
         let open = self.ix.order.len();
+        let focus = matches!(self.mode, Mode::Threads | Mode::Thread);
         let head = Line::from(vec![
-            Span::styled(" THREADS", bold(DIM)),
+            Span::styled(" THREADS", if focus { bold(ACCENT) } else { bold(DIM) }),
             Span::styled(format!("  {open} open"), fg(DIM)),
+            Span::styled(if focus { "  j k move · ⏎ open" } else { "  t to focus" }, fg(FAINT)),
         ]);
         buf.set_line(inner.x, inner.y, &head, inner.width);
         if open == 0 {
@@ -235,7 +250,7 @@ impl App {
         for id in &self.ix.order {
             let Some(t) = self.state.threads.iter().find(|t| t.id == *id) else { continue };
             let active = self.active == Some(*id);
-            let card = self.card(t, w, active);
+            let card = self.card(t, w, active, false);
             if active {
                 focus = (lines.len(), lines.len() + card.len());
             }
@@ -259,6 +274,19 @@ impl App {
         }
     }
 
+    /// One thread as a full page, in place of the document.
+    fn draw_thread(&mut self, f: &mut Frame, area: Rect) {
+        let Some(t) = self.active.and_then(|a| self.state.threads.iter().find(|t| t.id == a)) else { return };
+        let w = (area.width as usize).saturating_sub(8).min(100);
+        let mut lines = vec![Line::default()];
+        lines.extend(self.card(t, w, true, true));
+        lines.push(Line::default());
+        let keys = if t.kind.is_proposal() { "a accept · x reject · m modify · r reply" } else { "r reply · R resolve" };
+        lines.push(Line::from(Span::styled(format!("   {keys} · n N other thread · q back"), fg(DIM))));
+        self.detail_scroll = self.detail_scroll.min(lines.len().saturating_sub(area.height as usize));
+        f.render_widget(Paragraph::new(lines).scroll((self.detail_scroll as u16, 0)), area);
+    }
+
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let buf = f.buffer_mut();
         buf.set_style(area, Style::new().bg(BAR_BG));
@@ -271,6 +299,10 @@ impl App {
             pill("WRITE", NOTE)
         } else if self.mode == Mode::History {
             pill("HISTORY", AGENT)
+        } else if self.mode == Mode::Threads {
+            pill("THREADS", NOTE)
+        } else if self.mode == Mode::Thread {
+            pill("THREAD", NOTE)
         } else if self.sel.is_some() {
             pill("SELECT", HUMAN)
         } else {
@@ -285,6 +317,10 @@ impl App {
                     "save and quit the editor to apply the change"
                 } else if self.mode == Mode::History {
                     "j/k scroll · q back"
+                } else if self.mode == Mode::Threads {
+                    "j k move · enter open the thread · a x m r R act · q back"
+                } else if self.mode == Mode::Thread {
+                    "j k scroll · a x m r R act · n N other thread · q back to the list"
                 } else if self.sel.is_some() {
                     "e edit lines · c comment · d delete · esc cancel"
                 } else if active.is_some_and(|t| t.kind.is_proposal()) {
@@ -306,8 +342,8 @@ impl App {
 
     fn draw_history(&mut self, f: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = vec![Line::default()];
-        for e in self.history.iter().rev() {
-            let (head, detail) = e.describe();
+        for e in self.state.events.iter().rev() {
+            let (head, detail) = e.describe(&self.state);
             let who = if e.agent { AGENT } else { HUMAN };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {}  ", e.at.with_timezone(&Local).format("%b %d %H:%M")), fg(DIM)),
@@ -327,7 +363,7 @@ impl App {
                 lines.push(Line::from(Span::styled(format!("{:27}… {} more lines", "", n - 8), fg(FAINT))));
             }
         }
-        if self.history.is_empty() {
+        if self.state.events.is_empty() {
             lines.push(Line::from(Span::styled("  No history yet.", fg(DIM))));
         }
         self.hist_scroll = self.hist_scroll.min(lines.len().saturating_sub(area.height as usize));
@@ -354,6 +390,7 @@ impl App {
             ("a", "accept the proposal"),
             ("m", "modify the proposal, then accept"),
             ("x", "reject the proposal, with a reason"),
+            ("t", "thread list: j k move, enter opens the thread"),
             ("c", "comment on the block or selection"),
             ("r", "reply on the thread"),
             ("R", "resolve the comment"),

@@ -18,11 +18,18 @@
           postInstall = ''
             mkdir -p $out/share/redline
             cp -r skill $out/share/redline/skill
+            cp -r nvim $out/share/redline/nvim
           '';
           meta = {
             description = "Keyboard-driven TUI spec editor: humans write, agents suggest";
             mainProgram = "redline";
           };
+        };
+        # The Neovim plugin. It calls the `redline` binary on $PATH.
+        redline-nvim = pkgs.vimUtils.buildVimPlugin {
+          pname = "redline-nvim";
+          version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
+          src = ./nvim;
         };
         default = redline;
       });

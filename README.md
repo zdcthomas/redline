@@ -1,32 +1,67 @@
 # redline
 
-A keyboard-driven TUI spec editor. **The human writes the spec. Agents can only
-suggest.** It works like the suggestion mode of a word processor: comments,
-proposed additions, edits and deletions show inline, and you accept or reject
-each one. Every proposal, comment and decision goes into a history in
-`~/.redline/`.
+Review a spec with an agent, the way suggestion mode works in a word processor.
+**The human writes the spec. Agents can only suggest.** Comments, proposed
+additions, edits and deletions show inline, and the human accepts or rejects
+each one.
 
-```
- ▌redline   spec.md  ~/work/payments                                   3 open · 4 decided
-  3    ## Goals                                       │ THREADS  3 open
-  4                                                   │
-  5 ▌~ …returns a result in l̶e̶s̶s̶ ̶t̶h̶a̶n̶ ̶2̶ ̶s̶e̶c̶o̶n̶d̶s̶less    │ ▎ #1 ~ edit  claude · 2m        L5
-       than 800 ms at p99.                            │ ▎ − less than 2 seconds
-  6 ▏● It must be idempotent: a retry with the same   │ ▎ + less than 800 ms at p99
-       key must not charge twice.                     │ ▎ A latency target needs a percentile.
-                                                      │ ▎ a accept · x reject · m modify · r reply
- NORMAL   L5/24  a accept · x reject · m modify · r reply · n next thread
-```
+redline is three layers:
+
+1. **An event log.** Humans and agents push events (proposed, commented,
+   replied, accepted, rejected, resolved, edited). Nothing else is stored. The
+   threads you see are the fold of the events.
+2. **A CLI.** `redline` is the only program that reads and writes the log. It
+   is the contract for every front end.
+3. **Front ends.** A Neovim plugin, a standalone TUI, and the agent skill. All
+   of them call the CLI. An integration for another editor is a small wrapper
+   around the same commands.
 
 ## Install
 
 ```bash
-nix run github:zdcthomas/redline -- spec.md      # run
-nix profile install github:zdcthomas/redline     # install
+nix run github:zdcthomas/redline -- spec.md      # run the TUI
+nix profile install github:zdcthomas/redline     # install the CLI
 nix develop                                      # dev shell, then: cargo build
 ```
 
-## Use
+The flake has two packages: `redline` (the binary, with the skill and the
+plugin under `share/redline/`) and `redline-nvim` (the Neovim plugin as a
+`vimPlugin`).
+
+## Neovim
+
+Add `nvim/` to the runtime path (or use the `redline-nvim` package), then run
+`:Redline` in the spec buffer.
+
+```lua
+require('redline').setup({ author = 'zach' })   -- optional
+```
+
+Proposals show in the buffer as virtual text: removed text is struck through,
+added text is green, commented text has a highlight. You edit the buffer as
+usual. New proposals from the agent show while you write.
+
+| Key | Command | Action |
+|---|---|---|
+| `]r` `[r` | `:Redline next` / `prev` | next / previous thread |
+| `<localleader>ra` | `:Redline accept` | accept the proposal at the cursor |
+| `<localleader>rm` | `:Redline modify` | change the proposed text, then accept |
+| `<localleader>rx` | `:Redline reject` | reject, with a reason for the agent |
+| `<localleader>rc` | `:Redline comment` | comment on the line or the selection |
+| `<localleader>rr` | `:Redline reply` | reply on the thread |
+| `<localleader>rR` | `:Redline resolve` | resolve the comment |
+| `<localleader>rt` | `:Redline threads` | the thread list, as a buffer |
+| `<localleader>ro` | `:Redline thread` | open the thread as a buffer |
+| `<localleader>rh` | `:Redline history` | the event history |
+
+- **Thread list buffer:** one thread per line. `<cr>` goes to the thread in
+  the document, `o` opens the thread, `a` `x` `m` `r` `R` act on the line.
+- **Thread buffer:** the full thread as Markdown. Write below the marker line
+  and `:w` to send a reply. `a` `x` `m` `R` decide, `<cr>` goes to the text.
+- An accept changes the buffer, not the file, so `u` undoes it. A save records
+  your edit.
+
+## TUI
 
 ```bash
 redline spec.md
@@ -36,31 +71,22 @@ redline spec.md
 |---|---|
 | `j` `k` `{` `}` `gg` `G` `ctrl-d` `ctrl-u` | move |
 | `n` `N` | next / previous thread; `tab` cycles the threads on one line |
+| `t` | thread list mode: `j` `k` move, `enter` opens the thread as a page |
 | `e` or `enter` | edit the block (or the selected lines) in your editor |
 | `o` `O` | new block below / above |
 | `E` | edit the whole document |
 | `v` | select lines |
 | `dd` | delete the block (`d` on a selection) |
 | `u` | undo (an undo of an accept opens the proposal again) |
-| `a` | accept the proposal |
-| `m` | modify the proposed text in your editor, then accept |
-| `x` | reject the proposal; you can give a reason, and the agent reads it |
-| `c` | comment on the block or selection |
-| `r` `R` | reply on a thread / resolve a comment |
-| `H` | history of changes and decisions |
-| `\` | show / hide the thread sidebar |
-| `?` `q` | help / quit |
+| `a` `m` `x` | accept / modify then accept / reject with a reason |
+| `c` `r` `R` | comment / reply / resolve |
+| `H` | history |
+| `\` `?` `q` | show or hide the threads / help / quit |
 
-### Your editor
-
-redline has no text-entry mode of its own for the document. An edit opens
-**your editor** (`$VISUAL`, `$EDITOR`, or `editor` in the config) with your
-normal configuration, on only the text you edit, in a floating window:
-
-- in tmux: a `tmux display-popup`
-- outside tmux: a terminal that redline embeds in a floating pane
-
-Save and quit to apply the change. Quit with an error (`:cq` in vim) to cancel.
+The TUI has no text-entry mode for the document. An edit opens your editor
+(`$VISUAL`, `$EDITOR`, or `editor` in the config) on only the text you edit:
+in a `tmux display-popup` inside tmux, and in an embedded floating terminal
+outside tmux.
 
 `~/.redline/config.toml` (all keys optional):
 
@@ -74,9 +100,6 @@ popup_height = 84
 
 ## Agents
 
-An agent uses the CLI. It can read, propose, comment, reply and wait. It cannot
-accept, reject, resolve or edit.
-
 ```bash
 redline show spec.md                    # text + line numbers + open threads
 redline propose edit spec.md --text 'old words' --new 'new words' --why 'reason'
@@ -85,34 +108,65 @@ redline propose delete spec.md --lines 31 --why 'duplicate'
 redline comment spec.md --text 'some phrase' --body 'Is this a hard requirement?'
 redline reply spec.md 7 --body '…'
 redline wait spec.md                    # blocks until the human acts, prints what they did
-redline log spec.md                     # full history
 ```
 
-The TUI shows a new proposal in less than a second. `redline wait` gives the
-agent your decisions and your rejection reasons, so the loop is: propose, wait,
-read, propose again.
+`redline skill install` writes the agent skill to `~/.claude/skills/redline`.
 
-Install the agent skill (`skill/redline/SKILL.md`):
+The decision verbs need `--human`. An agent can pass that flag, so the rule
+"agents only suggest" is a convention that the skill states. The log records
+the actor of each event.
 
-```bash
-redline skill install                   # writes ~/.claude/skills/redline/SKILL.md
-```
+## Write an integration
 
-The Nix package also has the skill at `share/redline/skill/redline`, for a
-home-manager link.
+An editor integration needs these commands. Each prints JSON with `--json`.
+With `--stdin` a command works on the text of the unsaved buffer, which the
+editor sends on stdin, and it does not touch the file. Set `REDLINE_ROLE=human`
+in the environment, or pass `--human`.
 
-## Storage
+| Command | Use |
+|---|---|
+| `threads FILE --json --stdin` | The open threads. Each has `range.start` / `range.end` as `{line, col}` (0-based, byte columns) in the buffer text: draw these. |
+| `thread FILE ID --json --stdin` | One thread with its replies. |
+| `accept FILE ID --json --stdin [--new TEXT]` | Records the decision and returns `edit: {line, remove, insert}`: replace `remove` lines at `line` with the `insert` lines in the buffer. Without `--stdin` it changes the file. |
+| `reject FILE ID [--note TEXT]`, `resolve FILE ID`, `reopen FILE ID` | Decisions. |
+| `comment FILE --lines A-B --body TEXT --stdin`, `reply FILE ID --body TEXT` | Human comments. |
+| `sync FILE` | Call after each save. Records the saved change as the human's edit. |
+| `watch FILE` | Runs until stopped. Prints one JSON line for each new event: refresh on each line. |
+| `log FILE --json` | The history. |
+
+[nvim/lua/redline/init.lua](nvim/lua/redline/init.lua) is a full example.
+
+## The event log
 
 ```
 ~/.redline/                    # or $REDLINE_HOME
   config.toml
+  replica                      # the id of this machine's log
   docs/<name>-<hash>/          # one directory per document path
     meta.json                  # the document path
-    state.json                 # threads: comments and proposals, with status
-    history.jsonl              # append-only log: proposals, comments, decisions, edits
+    events/<replica>.jsonl     # append-only log, one file per replica
     snapshot.md                # the text redline last saw
 ```
 
-The spec stays a plain Markdown file where you put it. Threads point at quoted
-text, not at line numbers, so they move with your edits. If something changes
-the file outside redline, the history records it as an external change.
+One event:
+
+```json
+{"id":"0000000c-93d0c69a","lamport":12,"replica":"93d0c69a","at":"…","actor":"claude","agent":true,
+ "type":"proposed","kind":"edit","line":4,"quote":"less than 2 seconds","new":"less than 800 ms","tight":false,"why":"…"}
+```
+
+- **Merge.** The log is a grow-only set. Each replica appends only to its own
+  file, so a file-sync tool can copy logs between machines with no conflict,
+  and `redline merge FILE other.jsonl` adds the events of another log. A merge
+  is a set union: the order and the number of merges do not matter.
+- **Same result on each replica.** The fold sorts the events by Lamport clock,
+  then replica id. Two decisions on one thread: the first in that order wins.
+- **Granularity.** Edits in a row by one actor, with no other event between
+  them and less than 30 minutes apart, are one event. The new event covers
+  the full change and names the event that it `supersedes`; the fold ignores
+  superseded events. Three saves give one edit event.
+- **Anchors.** A thread points at quoted text plus a line hint. Edit events
+  carry the changed lines, so the fold moves the hints with each edit.
+- **Limit.** The log is a CRDT. The document text is not: it is a plain file
+  with one writer, the human. redline does not merge two diverged copies of
+  the spec.

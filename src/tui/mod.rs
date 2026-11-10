@@ -7,11 +7,10 @@ mod ui;
 mod view;
 
 use crate::anchor;
-use crate::cli::{add_thread, new_thread};
+use crate::cli::num;
 use crate::config::{Config, Popup};
-use crate::store::{Actor, DocStore, Event, Kind, Reply, State, Status, Tx, What};
+use crate::store::{Actor, DocStore, Kind, State, Status, Tx, What};
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::ops::Range;
@@ -24,6 +23,10 @@ enum Mode {
     Normal,
     Help,
     History,
+    /// The thread list has the focus.
+    Threads,
+    /// One thread fills the document pane.
+    Thread,
 }
 
 enum InputPurpose {
@@ -89,17 +92,13 @@ pub struct App {
     undo: Vec<Undo>,
     session: Option<(term::Term, Job)>,
     input: Option<Input>,
-    history: Vec<Event>,
+    detail_scroll: usize,
     hist_scroll: usize,
     last_poll: Instant,
-    mtimes: (Option<SystemTime>, Option<SystemTime>),
+    stamp: (Option<SystemTime>, u64),
     max_id: u64,
     page: usize,
     quit: bool,
-}
-
-fn mtime(p: &Path) -> Option<SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
 fn shquote(p: &Path) -> String {
@@ -135,10 +134,10 @@ pub fn run(path: &Path) -> Result<()> {
         undo: vec![],
         session: None,
         input: None,
-        history: vec![],
+        detail_scroll: 0,
         hist_scroll: 0,
         last_poll: Instant::now(),
-        mtimes: (None, None),
+        stamp: (None, 0),
         max_id: 0,
         page: 20,
         quit: false,
@@ -214,7 +213,7 @@ impl App {
         if self.active.is_some_and(|a| !self.ix.order.contains(&a)) {
             self.active = None;
         }
-        self.mtimes = (mtime(&self.store.doc), mtime(&self.store.state_path()));
+        self.stamp = self.store.stamp();
     }
 
     /// Run a transaction and take over its result. `None` after an error.
@@ -234,8 +233,7 @@ impl App {
 
     /// Reload when the agent CLI or another program changed the files.
     fn poll_disk(&mut self) -> bool {
-        let now = (mtime(&self.store.doc), mtime(&self.store.state_path()));
-        if now == self.mtimes {
+        if self.store.stamp() == self.stamp {
             return false;
         }
         self.tx(|_, _| Ok(()));
@@ -319,7 +317,7 @@ impl App {
                 if tx.doc != before {
                     bail!("the file changed on disk during the edit; do the edit again");
                 }
-                tx.edit_doc(range, text, Some(via), me);
+                tx.edit_doc(range, text, via, me);
                 Ok(())
             })
             .is_some();
@@ -346,13 +344,11 @@ impl App {
             if let Some(id) = reopen {
                 let t = tx.state.thread(id)?;
                 if t.status == Status::Accepted {
-                    t.status = Status::Open;
-                    t.decided_at = None;
-                    t.decided_by = None;
-                    tx.log(me, What::Reopened { id });
+                    let thread = t.eid.clone();
+                    tx.log(me, What::Reopened { thread });
                 }
             }
-            tx.set_doc(u.doc, Some("undo"), me);
+            tx.set_doc(u.doc, "undo", me);
             Ok(())
         });
         self.sync_active();
@@ -374,13 +370,8 @@ impl App {
                 .apply(&tx.doc)
                 .context("the text that this proposal points at is gone; reject it (x)")?;
             let line = anchor::line_of(&tx.doc, range.start);
-            let th = tx.state.thread(id)?;
-            th.status = Status::Accepted;
-            th.decided_at = Some(Utc::now());
-            th.decided_by = Some(me.name.clone());
-            th.new = t.new.clone();
-            tx.edit_doc(range, &text, None, me);
-            tx.log(me, What::Accepted { id, modified, new: t.new, note: None });
+            tx.log(me, What::Accepted { thread: t.eid.clone(), modified, new: t.new.clone(), note: None });
+            tx.edit_doc(range, &text, "accept", me);
             Ok(line)
         });
         if let Some(line) = line {
@@ -398,9 +389,8 @@ impl App {
                     return self.say("empty comment: not added");
                 }
                 let id = self.tx(|tx, me| {
-                    let mut t = new_thread(Kind::Comment, me, quote, line);
-                    t.body = body;
-                    Ok(add_thread(tx, me, t))
+                    let eid = tx.log(me, What::Commented { line, quote, body });
+                    Ok(num(&tx.state, &eid))
                 });
                 if let Some(id) = id {
                     self.max_id = self.max_id.max(id);
@@ -414,25 +404,16 @@ impl App {
                     return self.say("empty reply: not added");
                 }
                 self.tx(|tx, me| {
-                    tx.state.thread(id)?.replies.push(Reply {
-                        author: me.name.clone(),
-                        agent: false,
-                        at: Utc::now(),
-                        body: body.clone(),
-                    });
-                    tx.log(me, What::Replied { id, body });
+                    let thread = tx.state.thread(id)?.eid.clone();
+                    tx.log(me, What::Replied { thread, body });
                     Ok(())
                 });
             }
             InputPurpose::Reject(id) => {
                 let note = (!body.is_empty()).then_some(body);
                 let ok = self.tx(|tx, me| {
-                    let t = tx.state.thread(id)?;
-                    t.status = Status::Rejected;
-                    t.decided_at = Some(Utc::now());
-                    t.decided_by = Some(me.name.clone());
-                    t.note = note.clone();
-                    tx.log(me, What::Rejected { id, note });
+                    let thread = tx.state.thread(id)?.eid.clone();
+                    tx.log(me, What::Rejected { thread, note });
                     Ok(())
                 });
                 if ok.is_some() {
@@ -445,11 +426,8 @@ impl App {
 
     fn resolve(&mut self, id: u64) {
         let ok = self.tx(|tx, me| {
-            let t = tx.state.thread(id)?;
-            t.status = Status::Resolved;
-            t.decided_at = Some(Utc::now());
-            t.decided_by = Some(me.name.clone());
-            tx.log(me, What::Resolved { id });
+            let thread = tx.state.thread(id)?.eid.clone();
+            tx.log(me, What::Resolved { thread });
             Ok(())
         });
         if ok.is_some() {
@@ -621,6 +599,39 @@ impl App {
                 KeyCode::Char('q' | 'H') | KeyCode::Esc => self.mode = Mode::Normal,
                 _ => {}
             },
+            Mode::Threads => {
+                match k.code {
+                    KeyCode::Char('j' | 'n') | KeyCode::Down => self.step_thread(true),
+                    KeyCode::Char('k' | 'N') | KeyCode::Up => self.step_thread(false),
+                    KeyCode::Enter | KeyCode::Char('o' | 'l') if self.active.is_some() => {
+                        self.detail_scroll = 0;
+                        self.mode = Mode::Thread;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q' | 't' | 'h') => self.mode = Mode::Normal,
+                    KeyCode::Char('a' | 'x' | 'm' | 'r' | 'R' | 'u' | '?' | 'H') => self.normal_key(k, terminal)?,
+                    _ => {}
+                }
+                if self.active.is_none() && !self.ix.order.is_empty() {
+                    self.step_thread(true);
+                }
+            }
+            Mode::Thread => {
+                match k.code {
+                    KeyCode::Char('j') | KeyCode::Down => self.detail_scroll += 1,
+                    KeyCode::Char('k') | KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                    KeyCode::Char('n') => self.step_thread(true),
+                    KeyCode::Char('N') => self.step_thread(false),
+                    KeyCode::Esc | KeyCode::Char('q' | 'h') => self.mode = Mode::Threads,
+                    KeyCode::Char('a' | 'x' | 'm' | 'r' | 'R' | 'u') => self.normal_key(k, terminal)?,
+                    _ => {}
+                }
+                if self.active.is_none() {
+                    self.mode = Mode::Threads;
+                    if !self.ix.order.is_empty() {
+                        self.step_thread(true);
+                    }
+                }
+            }
             Mode::Normal => self.normal_key(k, terminal)?,
         }
         Ok(())
@@ -752,9 +763,14 @@ impl App {
             }
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('H') => {
-                self.history = self.store.history().unwrap_or_default();
                 self.hist_scroll = 0;
                 self.mode = Mode::History;
+            }
+            KeyCode::Char('t') => {
+                if self.active.is_none() {
+                    self.step_thread(true);
+                }
+                self.mode = Mode::Threads;
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('\\') => self.show_side = !self.show_side,
