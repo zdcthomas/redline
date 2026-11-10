@@ -55,10 +55,12 @@ usual. New proposals from the agent show while you write.
 | `<leader>rh` | `:Redline history` | the event history |
 | `g?` | `:Redline help` | show the keys for the current buffer |
 
-- **Thread list buffer:** one thread per line. `<cr>` goes to the thread in
-  the document, `o` opens the thread, `a` `x` `m` `r` `R` act on the line.
+- **Thread list buffer:** one thread per line. The thread on the cursor line
+  shows as a highlight in the document. `<cr>` opens the thread, `gd` goes to
+  the text, `a` `x` `m` `r` `R` act on the line.
 - **Thread buffer:** the full thread as Markdown. Write below the marker line
-  and `:w` to send a reply. `a` `x` `m` `R` decide, `<cr>` goes to the text.
+  and `:w` to send a reply. `a` `x` `m` `R` decide, `<cr>` goes to the text,
+  `q` goes back to the list.
 - An accept changes the buffer, not the file, so `u` undoes it. A save records
   your edit.
 

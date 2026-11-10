@@ -3,6 +3,7 @@
 local M = {}
 local api = vim.api
 local ns = api.nvim_create_namespace('redline')
+local focus_ns = api.nvim_create_namespace('redline_focus')
 
 M.config = {
   bin = 'redline',
@@ -33,6 +34,8 @@ local function hl()
   set('RedlineSignInsert', { fg = '#82d68c' })
   set('RedlineSignDelete', { fg = '#f0787c' })
   set('RedlineMeta', { link = 'Comment' })
+  set('RedlineFocus', { bg = '#46557f', bold = true })
+  set('RedlineFocusLine', { bg = '#262b3d' })
 end
 
 local function buf_text(buf)
@@ -212,6 +215,39 @@ local function doc_win(buf)
     if api.nvim_win_get_buf(w) == buf then
       return w
     end
+  end
+end
+
+-- Mark one thread in the document and scroll the document window to it.
+-- The cursor stays where it is. `nil` removes the mark.
+local function focus(buf, t)
+  if not api.nvim_buf_is_valid(buf) then
+    return
+  end
+  api.nvim_buf_clear_namespace(buf, focus_ns, 0, -1)
+  if not t or not has_range(t) then
+    return
+  end
+  local s, e = t.range.start, t.range['end']
+  pcall(function()
+    for row = s.line, e.line do
+      api.nvim_buf_set_extmark(buf, focus_ns, row, 0, { line_hl_group = 'RedlineFocusLine', priority = 190 })
+    end
+    if e.line > s.line or e.col > s.col then
+      api.nvim_buf_set_extmark(buf, focus_ns, s.line, s.col, {
+        end_row = e.line,
+        end_col = e.col,
+        hl_group = 'RedlineFocus',
+        priority = 200,
+      })
+    end
+  end)
+  local win = doc_win(buf)
+  if win and win ~= api.nvim_get_current_win() then
+    pcall(api.nvim_win_set_cursor, win, { s.line + 1, s.col })
+    api.nvim_win_call(win, function()
+      vim.cmd('normal! zz')
+    end)
   end
 end
 
@@ -483,21 +519,42 @@ function M.threads()
     api.nvim_win_set_buf(0, b)
     vim.wo.wrap = false
     vim.wo.cursorline = true
-    vim.wo.winbar = ' redline threads · ⏎ go · o open · a x m r R · q · g? keys'
+    vim.wo.winbar = ' redline threads · ⏎ open · gd go to text · a x m r R · q · g? keys'
   end
   act_keys(b)
-  vim.keymap.set('n', '<cr>', function()
+  local open = function()
+    local t = pick(buf)
+    if t then
+      M.thread(t.id)
+    end
+  end
+  vim.keymap.set('n', '<cr>', open, { buffer = b, nowait = true, desc = 'redline: open the thread as a buffer' })
+  vim.keymap.set('n', 'o', open, { buffer = b, nowait = true, desc = 'redline: open the thread as a buffer' })
+  vim.keymap.set('n', 'gd', function()
     local t = pick(buf)
     if t then
       jump(buf, t)
     end
   end, { buffer = b, desc = 'redline: go to the thread in the document' })
-  vim.keymap.set('n', 'o', function()
-    local t = pick(buf)
-    if t then
-      M.thread(t.id)
-    end
-  end, { buffer = b, nowait = true, desc = 'redline: open the thread' })
+  -- The thread on the cursor line shows as a highlight in the document.
+  local group = api.nvim_create_augroup('redline_list_' .. b, { clear = true })
+  api.nvim_create_autocmd({ 'CursorMoved', 'BufEnter' }, {
+    group = group,
+    buffer = b,
+    callback = function()
+      if docs[buf] then
+        local id = tonumber(api.nvim_get_current_line():match('^#(%d+)'))
+        focus(buf, id and find(buf, id))
+      end
+    end,
+  })
+  api.nvim_create_autocmd({ 'BufLeave', 'BufWipeout' }, {
+    group = group,
+    buffer = b,
+    callback = function()
+      focus(buf, nil)
+    end,
+  })
   render_list(buf)
 end
 
@@ -572,12 +629,37 @@ function M.thread(id)
     vim.b[b].redline_doc = buf
     vim.b[b].redline_thread = id
     act_keys(b)
-    vim.keymap.set('n', '<cr>', function()
+    local go = function()
       local th = find(buf, id)
       if th then
         jump(buf, th)
       end
-    end, { buffer = b, desc = 'redline: go to the thread in the document' })
+    end
+    vim.keymap.set('n', '<cr>', go, { buffer = b, desc = 'redline: go to the thread in the document' })
+    vim.keymap.set('n', 'gd', go, { buffer = b, desc = 'redline: go to the thread in the document' })
+    -- q goes back to the thread list when there is one.
+    vim.keymap.set('n', 'q', function()
+      local list = vim.fn.bufnr('redline://threads/' .. d.file)
+      if list ~= -1 and vim.fn.bufwinid(list) == -1 then
+        api.nvim_win_set_buf(0, list)
+      else
+        vim.cmd('close')
+      end
+    end, { buffer = b, nowait = true, desc = 'redline: back to the thread list' })
+    api.nvim_create_autocmd('BufEnter', {
+      buffer = b,
+      callback = function()
+        if docs[buf] then
+          focus(buf, find(buf, id))
+        end
+      end,
+    })
+    api.nvim_create_autocmd({ 'BufLeave', 'BufWipeout' }, {
+      buffer = b,
+      callback = function()
+        focus(buf, nil)
+      end,
+    })
     api.nvim_create_autocmd('BufWriteCmd', {
       buffer = b,
       callback = function()
@@ -612,8 +694,9 @@ function M.thread(id)
   api.nvim_buf_set_lines(b, 0, -1, false, L)
   vim.bo[b].modified = false
   vim.wo.wrap = true
-  vim.wo.winbar = ' redline thread · a accept · x reject · m modify · R resolve · ⏎ go · :w sends the reply · g? keys'
+  vim.wo.winbar = ' redline thread · a x m R decide · ⏎ go to text · :w sends the reply · q back · g? keys'
   api.nvim_win_set_cursor(0, { #L, 0 })
+  focus(buf, find(buf, id))
 end
 
 function M.history()
@@ -643,8 +726,9 @@ function M.help()
   if vim.b[cur].redline_list then
     rows = {
       { 'THREAD LIST' },
-      { '<cr>', 'go to the thread in the document' },
-      { 'o', 'open the thread as a buffer' },
+      { 'j  k', 'move: the thread on the cursor line shows in the document' },
+      { '<cr>  o', 'open the thread as a buffer' },
+      { 'gd', 'go to the thread in the document' },
       { 'a', 'accept the proposal' },
       { 'm', 'modify the proposal, then accept' },
       { 'x', 'reject the proposal, with a reason' },
@@ -656,13 +740,13 @@ function M.help()
     rows = {
       { 'THREAD' },
       { ':w', 'send the text below the marker line as a reply' },
-      { '<cr>', 'go to the thread in the document' },
+      { '<cr>  gd', 'go to the thread in the document' },
       { 'a', 'accept the proposal' },
       { 'm', 'modify the proposal, then accept' },
       { 'x', 'reject the proposal, with a reason' },
       { 'r', 'reply in a small buffer' },
       { 'R', 'resolve the comment' },
-      { 'q', 'close the thread' },
+      { 'q', 'back to the thread list' },
     }
   else
     rows = {
