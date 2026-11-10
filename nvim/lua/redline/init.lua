@@ -11,6 +11,9 @@ M.config = {
   keys = true, -- set buffer-local keymaps on attach
   prefix = '<leader>r',
   list_width = 56,
+  -- How a comment shows its bounds: 'bg' (background), 'brackets' (virtual
+  -- { and }), or 'carets' (a virtual line of ^ below the text).
+  comment_style = 'bg',
 }
 
 -- per document buffer: { file, threads, watch, timer }
@@ -34,6 +37,7 @@ local function hl()
   set('RedlineSignInsert', { fg = '#82d68c' })
   set('RedlineSignDelete', { fg = '#f0787c' })
   set('RedlineMeta', { link = 'Comment' })
+  set('RedlineBound', { fg = '#f0c674', bold = true })
   set('RedlineFocus', { bg = '#46557f', bold = true })
   set('RedlineFocusLine', { bg = '#262b3d' })
 end
@@ -107,14 +111,53 @@ local function render(buf)
             virt_text_pos = 'eol',
           }))
         else
-          local group = t.kind == 'comment' and 'RedlineComment' or 'RedlineDelete'
-          api.nvim_buf_set_extmark(buf, ns, s.line, s.col, vim.tbl_extend('force', sign, {
-            end_row = e.line,
-            end_col = e.col,
-            hl_group = group,
-            virt_text = meta,
-            virt_text_pos = 'eol',
-          }))
+          local style = t.kind == 'comment' and M.config.comment_style or 'bg'
+          local mark = function(row, col, opts)
+            api.nvim_buf_set_extmark(buf, ns, row, col, opts)
+          end
+          if style == 'brackets' then
+            -- Virtual braces around the text.
+            mark(s.line, s.col, vim.tbl_extend('force', sign, {
+              virt_text = { { '{', 'RedlineBound' } },
+              virt_text_pos = 'inline',
+              right_gravity = false,
+            }))
+            mark(e.line, e.col, { virt_text = { { '}', 'RedlineBound' } }, virt_text_pos = 'inline' })
+            mark(s.line, 0, { virt_text = meta, virt_text_pos = 'eol' })
+          elseif style == 'carets' then
+            -- A virtual line of ^ below the text, like a compiler message.
+            -- A range of more than one line also gets a line of v above it.
+            local w = vim.fn.strdisplaywidth
+            local first = api.nvim_buf_get_lines(buf, s.line, s.line + 1, false)[1] or ''
+            local last = api.nvim_buf_get_lines(buf, e.line, e.line + 1, false)[1] or ''
+            local gist = vim.split(t.body or '', '\n', { plain = true })[1]
+            local label = { (' #%d %s: %s'):format(t.id, t.author, gist), 'RedlineMeta' }
+            local pad = (' '):rep(w(first:sub(1, s.col)))
+            if s.line == e.line then
+              local n = math.max(1, w(first:sub(s.col + 1, e.col)))
+              mark(s.line, 0, vim.tbl_extend('force', sign, {
+                virt_lines = { { { pad .. ('^'):rep(n), 'RedlineBound' }, label } },
+              }))
+            else
+              local n = math.max(1, w(first:sub(s.col + 1)))
+              mark(s.line, 0, vim.tbl_extend('force', sign, {
+                virt_lines = { { { pad .. ('v'):rep(n), 'RedlineBound' } } },
+                virt_lines_above = true,
+              }))
+              mark(e.line, 0, {
+                virt_lines = { { { ('^'):rep(math.max(1, w(last:sub(1, e.col)))), 'RedlineBound' }, label } },
+              })
+            end
+          else
+            local group = t.kind == 'comment' and 'RedlineComment' or 'RedlineDelete'
+            mark(s.line, s.col, vim.tbl_extend('force', sign, {
+              end_row = e.line,
+              end_col = e.col,
+              hl_group = group,
+              virt_text = meta,
+              virt_text_pos = 'eol',
+            }))
+          end
           if t.kind == 'edit' then
             local vl = {}
             for i = 2, #new do
@@ -430,24 +473,113 @@ function M.reply(id)
   end)
 end
 
--- Comment on the current line, or on lines line1..line2.
-function M.comment(range)
+-- ── operators: comment, delete and edit take a motion ─────────────────────
+
+-- The text that a command points at: { text, line1, line2, linewise }.
+-- `kind` is 'line', 'char' or 'block' (from an operator), or a visual mode.
+local function region(p1, p2, kind)
+  local linewise = kind == 'line' or kind == 'V'
+  if p1[2] > p2[2] or (p1[2] == p2[2] and p1[3] > p2[3]) then
+    p1, p2 = p2, p1
+  end
+  local lines = vim.fn.getregion(p1, p2, { type = linewise and 'V' or 'v' })
+  return { text = table.concat(lines, '\n'), line1 = p1[2], line2 = p2[2], linewise = linewise }
+end
+
+local function line_region(l1, l2)
+  local lines = api.nvim_buf_get_lines(0, l1 - 1, l2, false)
+  return { text = table.concat(lines, '\n'), line1 = l1, line2 = l2, linewise = true }
+end
+
+-- CLI arguments that point at a region.
+local function target_args(r)
+  if r.linewise then
+    return { '--lines', r.line1 == r.line2 and tostring(r.line1) or (r.line1 .. '-' .. r.line2) }
+  end
+  return { '--text', r.text, '--near-line', tostring(r.line1) }
+end
+
+local function where(r)
+  return 'L' .. (r.line1 == r.line2 and r.line1 or (r.line1 .. '–' .. r.line2))
+end
+
+local function comment_region(buf, r)
+  compose('comment on ' .. where(r), '', function(text)
+    if text == '' then
+      return
+    end
+    local args = { 'comment', docs[buf].file, '--body', text, '--stdin' }
+    vim.list_extend(args, target_args(r))
+    if cli(args, buf_text(buf)) then
+      after(buf)
+    end
+  end)
+end
+
+-- Suggest that the text goes away. The text stays until someone accepts.
+local function delete_region(buf, r)
+  local args = { 'propose', 'delete', docs[buf].file, '--stdin' }
+  vim.list_extend(args, target_args(r))
+  if cli(args, buf_text(buf)) then
+    vim.notify('redline: suggested a delete on ' .. where(r))
+    after(buf)
+  end
+end
+
+-- Suggest a replacement. The buffer starts with the current text.
+local function edit_region(buf, r)
+  compose('suggest an edit on ' .. where(r), r.text, function(text)
+    if text == '' or text == vim.trim(r.text) then
+      return vim.notify('redline: no change: nothing suggested', vim.log.levels.INFO)
+    end
+    local args = { 'propose', 'edit', docs[buf].file, '--new', text, '--stdin' }
+    vim.list_extend(args, target_args(r))
+    if cli(args, buf_text(buf)) then
+      vim.notify('redline: suggested an edit on ' .. where(r))
+      after(buf)
+    end
+  end)
+end
+
+local ACTIONS = { comment = comment_region, delete = delete_region, edit = edit_region }
+local pending_action
+
+-- 'operatorfunc' target. Neovim calls it after the motion.
+function M._operator(kind)
+  local buf = doc_buf()
+  if buf and pending_action then
+    ACTIONS[pending_action](buf, region(vim.fn.getpos("'["), vim.fn.getpos("']"), kind))
+  end
+end
+
+-- The keys that start an operator: use it in an `expr` mapping.
+-- `line = true` gives the doubled form that acts on the current line(s).
+function M.operator(action, line)
+  pending_action = action
+  vim.o.operatorfunc = "v:lua.require'redline'._operator"
+  return line and 'g@_' or 'g@'
+end
+
+local function act_on_range(action, range)
   local buf = doc_buf()
   if not buf then
     return
   end
   range = type(range) == 'table' and range or nil
   local l1 = range and range.line1 or api.nvim_win_get_cursor(0)[1]
-  local l2 = range and range.line2 or l1
-  local lines = l1 == l2 and tostring(l1) or (l1 .. '-' .. l2)
-  compose('comment on L' .. lines, '', function(text)
-    if text == '' then
-      return
-    end
-    if cli({ 'comment', docs[buf].file, '--lines', lines, '--body', text, '--stdin' }, buf_text(buf)) then
-      after(buf)
-    end
-  end)
+  ACTIONS[action](buf, line_region(l1, range and range.line2 or l1))
+end
+
+-- Comment on / suggest a delete of / suggest an edit of the current line,
+-- or of lines range.line1..range.line2.
+function M.comment(range)
+  act_on_range('comment', range)
+end
+function M.delete(range)
+  act_on_range('delete', range)
+end
+function M.edit(range)
+  act_on_range('edit', range)
 end
 
 -- ── thread list buffer ────────────────────────────────────────────────────
@@ -716,6 +848,23 @@ function M.history()
   api.nvim_win_set_cursor(0, { api.nvim_buf_line_count(b), 0 })
 end
 
+-- Set how comments show their bounds: 'bg', 'brackets' or 'carets'. With no
+-- name, go to the next style.
+function M.style(name)
+  local styles = { 'bg', 'brackets', 'carets' }
+  if not vim.tbl_contains(styles, name) then
+    local i = vim.fn.index(styles, M.config.comment_style)
+    name = styles[(i + 1) % #styles + 1]
+  end
+  M.config.comment_style = name
+  for buf in pairs(docs) do
+    if api.nvim_buf_is_valid(buf) then
+      render(buf)
+    end
+  end
+  vim.notify('redline: comment style: ' .. name)
+end
+
 -- ── help ─────────────────────────────────────────────────────────────────
 
 -- Show the key bindings for the current buffer in a floating window.
@@ -756,13 +905,18 @@ function M.help()
       { p .. 'a', 'accept the proposal at the cursor' },
       { p .. 'm', 'modify the proposal, then accept' },
       { p .. 'x', 'reject the proposal, with a reason' },
-      { p .. 'c', 'comment on the line, or on the selection' },
+      { p .. 'c{motion}', 'comment on the text of the motion' },
+      { p .. 'd{motion}', 'suggest a delete of that text' },
+      { p .. 'e{motion}', 'suggest an edit of that text' },
+      { p .. 'cc  dd  ee', 'the same, for the line (a count works)' },
+      { '{visual}' .. p .. 'c d e', 'the same, for the selection' },
       { p .. 'r', 'reply on the thread' },
       { p .. 'R', 'resolve the comment' },
       { 'THREADS' },
       { p .. 't', 'thread list, as a buffer' },
       { p .. 'o', 'open the thread at the cursor as a buffer' },
       { p .. 'h', 'history of events' },
+      { ':Redline style', 'next comment style: bg, brackets, carets' },
       { 'WRITE' },
       { ':w', 'a save records your edit' },
       { 'u', 'undo, also for an accept' },
@@ -771,7 +925,7 @@ function M.help()
   rows[#rows + 1] = { 'g?', 'this help' }
   local lines, marks, width = {}, {}, 0
   for _, r in ipairs(rows) do
-    local line = r[2] and ('  %-18s %s'):format(r[1], r[2]) or (' ' .. r[1])
+    local line = r[2] and ('  %-24s %s'):format(r[1], r[2]) or (' ' .. r[1])
     lines[#lines + 1] = line
     marks[#marks + 1] = r[2] and { 'Special', 2, 2 + #r[1] } or { 'Title', 0, #line }
     width = math.max(width, vim.fn.strdisplaywidth(line))
@@ -870,12 +1024,22 @@ function M.attach()
     map('n', p .. 'a', function() M.accept() end, 'accept the proposal')
     map('n', p .. 'm', function() M.modify() end, 'modify the proposal, then accept')
     map('n', p .. 'x', function() M.reject() end, 'reject the proposal')
-    map('n', p .. 'c', function() M.comment() end, 'comment on the line')
-    map('x', p .. 'c', function()
-      local a, b = vim.fn.line('v'), vim.fn.line('.')
-      api.nvim_feedkeys(api.nvim_replace_termcodes('<esc>', true, false, true), 'nx', false)
-      M.comment({ line1 = math.min(a, b), line2 = math.max(a, b) })
-    end, 'comment on the selected lines')
+    -- Operators: prefix + c/d/e, then a motion or a text object. The doubled
+    -- key acts on the line. In visual mode they act on the selection.
+    for key, action in pairs({ c = 'comment', d = 'delete', e = 'edit' }) do
+      local what = action == 'comment' and 'comment on' or ('suggest a ' .. action .. ' of')
+      vim.keymap.set('n', p .. key, function()
+        return M.operator(action)
+      end, { buffer = buf, expr = true, desc = ('redline: %s {motion}'):format(what) })
+      vim.keymap.set('n', p .. key .. key, function()
+        return M.operator(action, true)
+      end, { buffer = buf, expr = true, desc = ('redline: %s the line'):format(what) })
+      map('x', p .. key, function()
+        local r = region(vim.fn.getpos('v'), vim.fn.getpos('.'), vim.fn.mode())
+        api.nvim_feedkeys(api.nvim_replace_termcodes('<esc>', true, false, true), 'nx', false)
+        ACTIONS[action](buf, r)
+      end, what .. ' the selection')
+    end
     map('n', p .. 'r', function() M.reply() end, 'reply on the thread')
     map('n', p .. 'R', function() M.resolve() end, 'resolve the comment')
     map('n', p .. 't', M.threads, 'thread list')

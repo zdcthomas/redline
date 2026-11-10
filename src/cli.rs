@@ -245,6 +245,8 @@ enum Propose {
         why: String,
         #[command(flatten)]
         who: Who,
+        #[command(flatten)]
+        buf: Buf,
     },
     /// Add text after a line.
     Insert {
@@ -276,6 +278,8 @@ enum Propose {
         why: String,
         #[command(flatten)]
         who: Who,
+        #[command(flatten)]
+        buf: Buf,
     },
 }
 
@@ -496,16 +500,16 @@ pub fn run() -> Result<()> {
             let store = DocStore::open(&file)?;
             let ((id, line), ..) = store.transact(|tx| {
                 let (who, line, quote, new, tight, why) = match &what {
-                    Propose::Edit { target, new, why, who, .. } => {
-                        let (quote, line) = find_target(&tx.doc, target)?;
+                    Propose::Edit { target, new, why, who, buf, .. } => {
+                        let (quote, line) = find_target(&buf.text(tx)?, target)?;
                         let new = text_arg(new)?.trim_matches('\n').to_string();
                         if new == quote {
                             bail!("the new text is the same as the old text");
                         }
                         (who.actor(), line, quote, new, false, why.clone())
                     }
-                    Propose::Delete { target, why, who, .. } => {
-                        let (quote, line) = find_target(&tx.doc, target)?;
+                    Propose::Delete { target, why, who, buf, .. } => {
+                        let (quote, line) = find_target(&buf.text(tx)?, target)?;
                         (who.actor(), line, quote, String::new(), false, why.clone())
                     }
                     Propose::Insert { after_line, after, text, tight, why, who, .. } => {

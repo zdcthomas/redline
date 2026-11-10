@@ -47,14 +47,22 @@ usual. New proposals from the agent show while you write.
 | `<leader>ra` | `:Redline accept` | accept the proposal at the cursor |
 | `<leader>rm` | `:Redline modify` | change the proposed text, then accept |
 | `<leader>rx` | `:Redline reject` | reject, with a reason for the agent |
-| `<leader>rc` | `:Redline comment` | comment on the line or the selection |
+| `<leader>rc{motion}` | `:{range}Redline comment` | comment on the text of the motion |
+| `<leader>rd{motion}` | `:{range}Redline delete` | suggest a delete of that text |
+| `<leader>re{motion}` | `:{range}Redline edit` | suggest an edit of that text |
 | `<leader>rr` | `:Redline reply` | reply on the thread |
 | `<leader>rR` | `:Redline resolve` | resolve the comment |
 | `<leader>rt` | `:Redline threads` | the thread list, as a buffer |
 | `<leader>ro` | `:Redline thread` | open the thread as a buffer |
 | `<leader>rh` | `:Redline history` | the event history |
 | `g?` | `:Redline help` | show the keys for the current buffer |
+| | `:Redline style [name]` | how a comment shows its bounds: `bg`, `brackets` (virtual `{` `}`) or `carets` (a virtual line of `^`); also `comment_style` in `setup` |
 
+- **Operators:** `c`, `d` and `e` after the prefix wait for a motion or a text
+  object, like `d` and `c` in Vim: `<leader>rcip` comments on the paragraph,
+  `<leader>rdiw` suggests a delete of the word. The doubled key (`<leader>rcc`)
+  acts on the line, and a visual selection works too. A delete or an edit from
+  you is a suggestion: the text does not change until someone accepts it.
 - **Thread list buffer:** one thread per line. The thread on the cursor line
   shows as a highlight in the document. `<cr>` opens the thread, `gd` goes to
   the text, `a` `x` `m` `r` `R` act on the line.
