@@ -8,7 +8,7 @@ M.config = {
   bin = 'redline',
   author = nil, -- name in the history; default: the CLI config, then $USER
   keys = true, -- set buffer-local keymaps on attach
-  prefix = '<localleader>r',
+  prefix = '<leader>r',
   list_width = 56,
 }
 

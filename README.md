@@ -44,15 +44,15 @@ usual. New proposals from the agent show while you write.
 | Key | Command | Action |
 |---|---|---|
 | `]r` `[r` | `:Redline next` / `prev` | next / previous thread |
-| `<localleader>ra` | `:Redline accept` | accept the proposal at the cursor |
-| `<localleader>rm` | `:Redline modify` | change the proposed text, then accept |
-| `<localleader>rx` | `:Redline reject` | reject, with a reason for the agent |
-| `<localleader>rc` | `:Redline comment` | comment on the line or the selection |
-| `<localleader>rr` | `:Redline reply` | reply on the thread |
-| `<localleader>rR` | `:Redline resolve` | resolve the comment |
-| `<localleader>rt` | `:Redline threads` | the thread list, as a buffer |
-| `<localleader>ro` | `:Redline thread` | open the thread as a buffer |
-| `<localleader>rh` | `:Redline history` | the event history |
+| `<leader>ra` | `:Redline accept` | accept the proposal at the cursor |
+| `<leader>rm` | `:Redline modify` | change the proposed text, then accept |
+| `<leader>rx` | `:Redline reject` | reject, with a reason for the agent |
+| `<leader>rc` | `:Redline comment` | comment on the line or the selection |
+| `<leader>rr` | `:Redline reply` | reply on the thread |
+| `<leader>rR` | `:Redline resolve` | resolve the comment |
+| `<leader>rt` | `:Redline threads` | the thread list, as a buffer |
+| `<leader>ro` | `:Redline thread` | open the thread as a buffer |
+| `<leader>rh` | `:Redline history` | the event history |
 | `g?` | `:Redline help` | show the keys for the current buffer |
 
 - **Thread list buffer:** one thread per line. `<cr>` goes to the thread in
