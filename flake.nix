@@ -25,6 +25,24 @@
             mainProgram = "redline";
           };
         };
+        # The native app (egui). It needs the window-system libraries at run time.
+        redline-app = pkgs.rustPlatform.buildRustPackage {
+          pname = "redline-app";
+          version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
+          src = pkgs.lib.cleanSource ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "-p" "redline-app" ];
+          cargoTestFlags = [ "-p" "redline-app" ];
+          postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            patchelf --add-rpath ${pkgs.lib.makeLibraryPath (with pkgs; [
+              wayland libxkbcommon libGL libx11 libxcursor libxi libxrandr
+            ])} $out/bin/redline-app
+          '';
+          meta = {
+            description = "Native app for redline";
+            mainProgram = "redline-app";
+          };
+        };
         # The Neovim plugin. It calls the `redline` binary on $PATH.
         redline-nvim = pkgs.vimUtils.buildVimPlugin {
           pname = "redline-nvim";

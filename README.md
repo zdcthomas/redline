@@ -12,8 +12,9 @@ redline is three layers:
    threads you see are the fold of the events.
 2. **A CLI.** `redline` is the only program that reads and writes the log. It
    is the contract for every front end.
-3. **Front ends.** A Neovim plugin, a standalone TUI, and the agent skill. All
-   of them call the CLI. An integration for another editor is a small wrapper
+3. **Front ends.** A Neovim plugin, a standalone TUI, a native app, and the
+   agent skill. The plugin and the agent call the CLI; the TUI and the app
+   use the same core as a library. An integration for another editor is a small wrapper
    around the same commands.
 
 ## Install
@@ -24,9 +25,9 @@ nix profile install github:zdcthomas/redline     # install the CLI
 nix develop                                      # dev shell, then: cargo build
 ```
 
-The flake has two packages: `redline` (the binary, with the skill and the
-plugin under `share/redline/`) and `redline-nvim` (the Neovim plugin as a
-`vimPlugin`).
+The flake has three packages: `redline` (the binary, with the skill and the
+plugin under `share/redline/`), `redline-nvim` (the Neovim plugin as a
+`vimPlugin`) and `redline-app` (the native app).
 
 ## Neovim
 
@@ -108,6 +109,18 @@ author = "zach"        # your name in the history; default: $USER
 popup_width = 84       # percent
 popup_height = 84
 ```
+
+## Native app
+
+```bash
+nix run github:zdcthomas/redline#redline-app -- spec.md
+```
+
+A window with the same layout and the same keys as the TUI: the document on
+the left with the suggestions inline, the threads on the right. `e` opens the
+block in a text box in the window, so the app needs no terminal and no
+external editor. The mouse also works: click a line or a thread. The app is in
+[app/](app/), written with egui, and it shows new agent proposals live.
 
 ## Agents
 

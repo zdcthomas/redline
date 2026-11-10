@@ -1,0 +1,10 @@
+[package]
+name = "redline-app"
+version = "0.2.0"
+edition = "2024"
+description = "Native app for redline: review agent suggestions on a spec"
+
+[dependencies]
+redline = { path = ".." }
+anyhow = "1"
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
