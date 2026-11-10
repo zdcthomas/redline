@@ -3,7 +3,7 @@ if vim.g.loaded_redline then
 end
 vim.g.loaded_redline = true
 
-local subs = { 'attach', 'detach', 'threads', 'thread', 'accept', 'modify', 'reject', 'comment', 'reply', 'resolve', 'next', 'prev', 'history', 'refresh' }
+local subs = { 'attach', 'detach', 'threads', 'thread', 'accept', 'modify', 'reject', 'comment', 'reply', 'resolve', 'next', 'prev', 'history', 'refresh', 'help' }
 
 vim.api.nvim_create_user_command('Redline', function(o)
   local r = require('redline')

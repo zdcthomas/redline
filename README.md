@@ -53,6 +53,7 @@ usual. New proposals from the agent show while you write.
 | `<localleader>rt` | `:Redline threads` | the thread list, as a buffer |
 | `<localleader>ro` | `:Redline thread` | open the thread as a buffer |
 | `<localleader>rh` | `:Redline history` | the event history |
+| `g?` | `:Redline help` | show the keys for the current buffer |
 
 - **Thread list buffer:** one thread per line. `<cr>` goes to the thread in
   the document, `o` opens the thread, `a` `x` `m` `r` `R` act on the line.

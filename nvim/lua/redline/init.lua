@@ -445,6 +445,7 @@ local function act_keys(b)
   map('r', function() M.reply() end, 'reply')
   map('R', function() M.resolve() end, 'resolve')
   map('q', '<cmd>close<cr>', 'close')
+  map('g?', M.help, 'show the keys')
 end
 
 render_list = function(buf)
@@ -482,7 +483,7 @@ function M.threads()
     api.nvim_win_set_buf(0, b)
     vim.wo.wrap = false
     vim.wo.cursorline = true
-    vim.wo.winbar = ' redline threads · ⏎ go · o open · a x m r R · q'
+    vim.wo.winbar = ' redline threads · ⏎ go · o open · a x m r R · q · g? keys'
   end
   act_keys(b)
   vim.keymap.set('n', '<cr>', function()
@@ -611,7 +612,7 @@ function M.thread(id)
   api.nvim_buf_set_lines(b, 0, -1, false, L)
   vim.bo[b].modified = false
   vim.wo.wrap = true
-  vim.wo.winbar = ' redline thread · a accept · x reject · m modify · R resolve · ⏎ go · :w sends the reply'
+  vim.wo.winbar = ' redline thread · a accept · x reject · m modify · R resolve · ⏎ go · :w sends the reply · g? keys'
   api.nvim_win_set_cursor(0, { #L, 0 })
 end
 
@@ -630,6 +631,94 @@ function M.history()
   set_lines(b, vim.split(vim.trim(out), '\n', { plain = true }))
   vim.keymap.set('n', 'q', '<cmd>close<cr>', { buffer = b, nowait = true })
   api.nvim_win_set_cursor(0, { api.nvim_buf_line_count(b), 0 })
+end
+
+-- ── help ─────────────────────────────────────────────────────────────────
+
+-- Show the key bindings for the current buffer in a floating window.
+function M.help()
+  local cur = api.nvim_get_current_buf()
+  local p = M.config.prefix
+  local rows
+  if vim.b[cur].redline_list then
+    rows = {
+      { 'THREAD LIST' },
+      { '<cr>', 'go to the thread in the document' },
+      { 'o', 'open the thread as a buffer' },
+      { 'a', 'accept the proposal' },
+      { 'm', 'modify the proposal, then accept' },
+      { 'x', 'reject the proposal, with a reason' },
+      { 'r', 'reply' },
+      { 'R', 'resolve the comment' },
+      { 'q', 'close the list' },
+    }
+  elseif vim.b[cur].redline_thread then
+    rows = {
+      { 'THREAD' },
+      { ':w', 'send the text below the marker line as a reply' },
+      { '<cr>', 'go to the thread in the document' },
+      { 'a', 'accept the proposal' },
+      { 'm', 'modify the proposal, then accept' },
+      { 'x', 'reject the proposal, with a reason' },
+      { 'r', 'reply in a small buffer' },
+      { 'R', 'resolve the comment' },
+      { 'q', 'close the thread' },
+    }
+  else
+    rows = {
+      { 'MOVE' },
+      { ']r  [r', 'next / previous thread' },
+      { 'REVIEW' },
+      { p .. 'a', 'accept the proposal at the cursor' },
+      { p .. 'm', 'modify the proposal, then accept' },
+      { p .. 'x', 'reject the proposal, with a reason' },
+      { p .. 'c', 'comment on the line, or on the selection' },
+      { p .. 'r', 'reply on the thread' },
+      { p .. 'R', 'resolve the comment' },
+      { 'THREADS' },
+      { p .. 't', 'thread list, as a buffer' },
+      { p .. 'o', 'open the thread at the cursor as a buffer' },
+      { p .. 'h', 'history of events' },
+      { 'WRITE' },
+      { ':w', 'a save records your edit' },
+      { 'u', 'undo, also for an accept' },
+    }
+  end
+  rows[#rows + 1] = { 'g?', 'this help' }
+  local lines, marks, width = {}, {}, 0
+  for _, r in ipairs(rows) do
+    local line = r[2] and ('  %-18s %s'):format(r[1], r[2]) or (' ' .. r[1])
+    lines[#lines + 1] = line
+    marks[#marks + 1] = r[2] and { 'Special', 2, 2 + #r[1] } or { 'Title', 0, #line }
+    width = math.max(width, vim.fn.strdisplaywidth(line))
+  end
+  local b = api.nvim_create_buf(false, true)
+  api.nvim_buf_set_lines(b, 0, -1, false, lines)
+  for i, m in ipairs(marks) do
+    api.nvim_buf_set_extmark(b, ns, i - 1, m[2], { end_col = m[3], hl_group = m[1] })
+  end
+  vim.bo[b].modifiable = false
+  vim.bo[b].bufhidden = 'wipe'
+  local win = api.nvim_open_win(b, true, {
+    relative = 'editor',
+    width = width + 2,
+    height = #lines,
+    row = math.max(0, math.floor((vim.o.lines - #lines) / 2) - 1),
+    col = math.max(0, math.floor((vim.o.columns - width - 2) / 2)),
+    style = 'minimal',
+    border = 'rounded',
+    title = ' redline keys ',
+    title_pos = 'center',
+  })
+  local close = function()
+    if api.nvim_win_is_valid(win) then
+      api.nvim_win_close(win, true)
+    end
+  end
+  for _, k in ipairs({ 'q', '<esc>', 'g?', '<cr>' }) do
+    vim.keymap.set('n', k, close, { buffer = b, nowait = true })
+  end
+  api.nvim_create_autocmd('BufLeave', { buffer = b, once = true, callback = close })
 end
 
 -- ── attach ────────────────────────────────────────────────────────────────
@@ -709,6 +798,7 @@ function M.attach()
     map('n', p .. 'o', function() M.thread() end, 'open the thread as a buffer')
     map('n', p .. 'h', M.history, 'history')
   end
+  vim.keymap.set('n', 'g?', M.help, { buffer = buf, desc = 'redline: show the keys' })
   M.refresh()
 end
 
