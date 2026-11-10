@@ -56,7 +56,7 @@ usual. New proposals from the agent show while you write.
 | `<leader>ro` | `:Redline thread` | open the thread as a buffer |
 | `<leader>rh` | `:Redline history` | the event history |
 | `g?` | `:Redline help` | show the keys for the current buffer |
-| `<leader>rs` | `:Redline style [name]` | how a comment shows its bounds: `bg`, `brackets` (virtual `{` `}`) or `carets` (a virtual line of `^`); also `comment_style` in `setup` |
+| `<leader>rs` | `:Redline style [name]` | how a comment shows: `bg` (background), `brackets` (virtual `{` `}`) or `lines` (an underline, and the comment on a colored virtual line below, like LSP virtual lines); also `comment_style` in `setup` |
 
 - **Operators:** `c`, `d` and `e` after the prefix wait for a motion or a text
   object, like `d` and `c` in Vim: `<leader>rcip` comments on the paragraph,

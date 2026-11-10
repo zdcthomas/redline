@@ -389,7 +389,7 @@ impl App {
                     return self.say("empty comment: not added");
                 }
                 let id = self.tx(|tx, me| {
-                    let eid = tx.log(me, What::Commented { line, quote, body });
+                    let eid = tx.log(me, What::Commented { line, col: 0, quote, body });
                     Ok(num(&tx.state, &eid))
                 });
                 if let Some(id) = id {

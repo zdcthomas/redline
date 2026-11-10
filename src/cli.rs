@@ -99,6 +99,10 @@ struct Target {
     /// If --text occurs more than once, take the occurrence nearest this line.
     #[arg(long)]
     near_line: Option<usize>,
+    /// With --near-line: the column (1-based, bytes) of the occurrence, for
+    /// text that occurs more than once on the line.
+    #[arg(long)]
+    near_col: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -303,8 +307,8 @@ fn text_arg(s: &str) -> Result<String> {
     Ok(buf)
 }
 
-/// Find the text a command points at: (quote, 0-based line).
-fn find_target(doc: &str, t: &Target) -> Result<(String, usize)> {
+/// Find the text a command points at: (quote, 0-based line, 0-based column).
+fn find_target(doc: &str, t: &Target) -> Result<(String, usize, usize)> {
     match (&t.text, &t.lines) {
         (Some(text), None) => {
             let text = text_arg(text)?;
@@ -312,11 +316,15 @@ fn find_target(doc: &str, t: &Target) -> Result<(String, usize)> {
             let occ = anchor::occurrences(doc, &text, false);
             match (occ.len(), t.near_line) {
                 (0, _) => bail!("the text is not in the document. Run `redline show` and copy it exactly"),
-                (1, _) => Ok((text, occ[0].1)),
+                (1, _) => Ok((text, occ[0].1, anchor::pos(doc, occ[0].0).1)),
                 (_, Some(near)) => {
                     let near = near.saturating_sub(1);
-                    let line = occ.iter().map(|o| o.1).min_by_key(|l| l.abs_diff(near)).unwrap();
-                    Ok((text, line))
+                    let col = t.near_col.unwrap_or(1).saturating_sub(1);
+                    let best = occ
+                        .iter()
+                        .min_by_key(|o| (o.1.abs_diff(near), anchor::pos(doc, o.0).1.abs_diff(col)))
+                        .unwrap();
+                    Ok((text, best.1, anchor::pos(doc, best.0).1))
                 }
                 _ => {
                     let lines: Vec<String> = occ.iter().map(|o| (o.1 + 1).to_string()).collect();
@@ -336,7 +344,7 @@ fn find_target(doc: &str, t: &Target) -> Result<(String, usize)> {
             if quote.trim().is_empty() {
                 bail!("lines {spec} are blank");
             }
-            Ok((quote, a - 1))
+            Ok((quote, a - 1, 0))
         }
         _ => bail!("give one of --text or --lines"),
     }
@@ -499,18 +507,18 @@ pub fn run() -> Result<()> {
             };
             let store = DocStore::open(&file)?;
             let ((id, line), ..) = store.transact(|tx| {
-                let (who, line, quote, new, tight, why) = match &what {
+                let (who, line, col, quote, new, tight, why) = match &what {
                     Propose::Edit { target, new, why, who, buf, .. } => {
-                        let (quote, line) = find_target(&buf.text(tx)?, target)?;
+                        let (quote, line, col) = find_target(&buf.text(tx)?, target)?;
                         let new = text_arg(new)?.trim_matches('\n').to_string();
                         if new == quote {
                             bail!("the new text is the same as the old text");
                         }
-                        (who.actor(), line, quote, new, false, why.clone())
+                        (who.actor(), line, col, quote, new, false, why.clone())
                     }
                     Propose::Delete { target, why, who, buf, .. } => {
-                        let (quote, line) = find_target(&buf.text(tx)?, target)?;
-                        (who.actor(), line, quote, String::new(), false, why.clone())
+                        let (quote, line, col) = find_target(&buf.text(tx)?, target)?;
+                        (who.actor(), line, col, quote, String::new(), false, why.clone())
                     }
                     Propose::Insert { after_line, after, text, tight, why, who, .. } => {
                         let n = anchor::line_starts(&tx.doc).len();
@@ -518,7 +526,7 @@ pub fn run() -> Result<()> {
                             (Some(l), None) if *l <= n => l.checked_sub(1),
                             (Some(l), None) => bail!("--after-line {l} is out of range: the document has {n} lines"),
                             (None, Some(a)) => {
-                                let t = Target { text: Some(a.clone()), lines: None, near_line: None };
+                                let t = Target { text: Some(a.clone()), lines: None, near_line: None, near_col: None };
                                 Some(find_target(&tx.doc, &t)?.1)
                             }
                             _ => bail!("give one of --after-line or --after"),
@@ -533,10 +541,10 @@ pub fn run() -> Result<()> {
                         if new.trim().is_empty() {
                             bail!("--text is empty");
                         }
-                        (who.actor(), at.unwrap_or(0), quote, new, *tight, why.clone())
+                        (who.actor(), at.unwrap_or(0), 0, quote, new, *tight, why.clone())
                     }
                 };
-                let eid = tx.log(&who, What::Proposed { kind, line, quote, new, tight, why });
+                let eid = tx.log(&who, What::Proposed { kind, line, col, quote, new, tight, why });
                 Ok((num(&tx.state, &eid), line))
             })?;
             println!("proposed {} #{id} at L{}. The human decides. Run `redline wait FILE` for the decision.", kind.name(), line + 1);
@@ -546,12 +554,12 @@ pub fn run() -> Result<()> {
             let store = DocStore::open(&file)?;
             let who = who.actor();
             let (id, ..) = store.transact(|tx| {
-                let (quote, line) = find_target(&buf.text(tx)?, &target)?;
+                let (quote, line, col) = find_target(&buf.text(tx)?, &target)?;
                 let body = text_arg(&body)?.trim().to_string();
                 if body.is_empty() {
                     bail!("--body is empty");
                 }
-                let eid = tx.log(&who, What::Commented { line, quote, body });
+                let eid = tx.log(&who, What::Commented { line, col, quote, body });
                 Ok(num(&tx.state, &eid))
             })?;
             if buf.json {

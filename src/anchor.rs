@@ -61,15 +61,16 @@ pub fn occurrences(doc: &str, quote: &str, whole_line: bool) -> Vec<(usize, usiz
     out
 }
 
-/// Find `quote` in `doc`; with several matches, take the one nearest `hint`.
-/// An empty quote means "top of the document".
-pub fn resolve(doc: &str, quote: &str, hint: usize, whole_line: bool) -> Option<Range<usize>> {
+/// Find `quote` in `doc`; with several matches, take the one nearest the
+/// hint: first by line, then by column. An empty quote means "top of the
+/// document".
+pub fn resolve(doc: &str, quote: &str, hint: usize, hint_col: usize, whole_line: bool) -> Option<Range<usize>> {
     if quote.is_empty() {
         return Some(0..0);
     }
     occurrences(doc, quote, whole_line)
         .into_iter()
-        .min_by_key(|(_, l)| l.abs_diff(hint))
+        .min_by_key(|(i, l)| (l.abs_diff(hint), pos(doc, *i).1.abs_diff(hint_col)))
         .map(|(i, _)| i..i + quote.len())
 }
 
@@ -157,9 +158,11 @@ mod tests {
     #[test]
     fn resolve_takes_nearest() {
         let d = "foo\nbar\nfoo\n";
-        assert_eq!(resolve(d, "foo", 2, false), Some(8..11));
-        assert_eq!(resolve(d, "foo", 0, false), Some(0..3));
-        assert_eq!(resolve(d, "zip", 0, false), None);
+        assert_eq!(resolve(d, "foo", 2, 0, false), Some(8..11));
+        assert_eq!(resolve(d, "foo", 0, 0, false), Some(0..3));
+        assert_eq!(resolve(d, "zip", 0, 0, false), None);
+        // two matches on one line: the column decides
+        assert_eq!(resolve("the cat and the dog\n", "the", 0, 12, false), Some(12..15));
     }
 
     #[test]

@@ -92,6 +92,8 @@ pub struct Thread {
     pub quote: String,
     /// 0-based line hint for the anchor.
     pub line: usize,
+    /// 0-based byte column hint: it picks one of several matches on a line.
+    pub col: usize,
     /// Edit/Insert: the proposed text.
     pub new: String,
     /// Insert: add the text on the next line, without blank lines around it.
@@ -106,7 +108,7 @@ pub struct Thread {
 
 impl Thread {
     pub fn locate(&self, doc: &str) -> Option<Range<usize>> {
-        anchor::resolve(doc, &self.quote, self.line, self.kind == Kind::Insert)
+        anchor::resolve(doc, &self.quote, self.line, self.col, self.kind == Kind::Insert)
     }
 
     /// The document edit that an accept of this proposal makes.
@@ -150,8 +152,23 @@ pub enum What {
     Tracked { path: String },
     /// The document text changed. `old` and `new` are whole lines.
     DocEdit { via: String, line: usize, old: String, new: String },
-    Proposed { kind: Kind, line: usize, quote: String, new: String, tight: bool, why: String },
-    Commented { line: usize, quote: String, body: String },
+    Proposed {
+        kind: Kind,
+        line: usize,
+        #[serde(default)]
+        col: usize,
+        quote: String,
+        new: String,
+        tight: bool,
+        why: String,
+    },
+    Commented {
+        line: usize,
+        #[serde(default)]
+        col: usize,
+        quote: String,
+        body: String,
+    },
     Replied { thread: String, body: String },
     Accepted { thread: String, modified: bool, new: String, note: Option<String> },
     Rejected { thread: String, note: Option<String> },
@@ -295,7 +312,7 @@ impl State {
                 t.note = note.clone();
             }
         };
-        let make = |kind: Kind, line: usize, quote: &str, new: &str, tight: bool, body: &str| Thread {
+        let make = |kind: Kind, line: usize, col: usize, quote: &str, new: &str, tight: bool, body: &str| Thread {
             id: self.threads.len() as u64 + 1,
             eid: e.id.clone(),
             kind,
@@ -305,6 +322,7 @@ impl State {
             at: e.at,
             quote: quote.into(),
             line,
+            col,
             new: new.into(),
             tight,
             body: body.into(),
@@ -315,12 +333,12 @@ impl State {
         };
         match &e.what {
             What::Tracked { .. } => {}
-            What::Proposed { kind, line, quote, new, tight, why } => {
-                let t = make(*kind, *line, quote, new, *tight, why);
+            What::Proposed { kind, line, col, quote, new, tight, why } => {
+                let t = make(*kind, *line, *col, quote, new, *tight, why);
                 self.threads.push(t);
             }
-            What::Commented { line, quote, body } => {
-                let t = make(Kind::Comment, *line, quote, "", false, body);
+            What::Commented { line, col, quote, body } => {
+                let t = make(Kind::Comment, *line, *col, quote, "", false, body);
                 self.threads.push(t);
             }
             What::DocEdit { line, old, new, .. } => {
@@ -376,13 +394,15 @@ fn reanchor(t: &mut Thread, p: usize, old: &str, new: &str) {
     }
     // The edit touched the anchor text.
     let whole_line = t.kind == Kind::Insert;
-    if let Some(r) = anchor::resolve(new, &t.quote, t.line.saturating_sub(p), whole_line) {
+    if let Some(r) = anchor::resolve(new, &t.quote, t.line.saturating_sub(p), t.col, whole_line) {
         t.line = p + anchor::line_of(new, r.start);
+        t.col = anchor::pos(new, r.start).1;
     } else if t.kind == Kind::Comment {
         // The human rewrote the text below a comment: keep the comment on the new text.
         if let Some((i, l)) = new.lines().enumerate().find(|(_, l)| !l.trim().is_empty()) {
             t.quote = l.to_string();
             t.line = p + i;
+            t.col = 0;
         }
     }
 }
@@ -723,7 +743,7 @@ mod tests {
     fn another_event_ends_the_run() {
         let mut t = tx("a\nb\n");
         t.set_doc("a\nB\n".into(), "edit", &human());
-        t.log(&agent(), What::Commented { line: 0, quote: "a".into(), body: "?".into() });
+        t.log(&agent(), What::Commented { line: 0, col: 0, quote: "a".into(), body: "?".into() });
         t.set_doc("A\nB\n".into(), "edit", &human());
         assert_eq!(edits(&t.state).len(), 2);
     }
@@ -731,8 +751,8 @@ mod tests {
     #[test]
     fn fold_does_not_depend_on_arrival_order() {
         let mut t = tx("one\ntwo\nthree\n");
-        let p = t.log(&agent(), What::Proposed { kind: Kind::Edit, line: 1, quote: "two".into(), new: "2".into(), tight: false, why: String::new() });
-        let c = t.log(&agent(), What::Commented { line: 2, quote: "three".into(), body: "why?".into() });
+        let p = t.log(&agent(), What::Proposed { kind: Kind::Edit, line: 1, col: 0, quote: "two".into(), new: "2".into(), tight: false, why: String::new() });
+        let c = t.log(&agent(), What::Commented { line: 2, col: 0, quote: "three".into(), body: "why?".into() });
         t.set_doc("zero\none\ntwo\nthree\n".into(), "edit", &human());
         t.log(&human(), What::Rejected { thread: p.clone(), note: Some("no".into()) });
         t.log(&human(), What::Accepted { thread: p, modified: false, new: "2".into(), note: None });

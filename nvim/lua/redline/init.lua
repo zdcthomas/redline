@@ -11,8 +11,8 @@ M.config = {
   keys = true, -- set buffer-local keymaps on attach
   prefix = '<leader>r',
   list_width = 56,
-  -- How a comment shows its bounds: 'bg' (background), 'brackets' (virtual
-  -- { and }), or 'carets' (a virtual line of ^ below the text).
+  -- How a comment shows: 'bg' (background), 'brackets' (virtual { and }), or
+  -- 'lines' (an underline, and the comment on a colored virtual line below).
   comment_style = 'bg',
 }
 
@@ -38,6 +38,7 @@ local function hl()
   set('RedlineSignDelete', { fg = '#f0787c' })
   set('RedlineMeta', { link = 'Comment' })
   set('RedlineBound', { fg = '#f0c674', bold = true })
+  set('RedlineUnderline', { underline = true, sp = '#f0c674' })
   set('RedlineFocus', { bg = '#46557f', bold = true })
   set('RedlineFocusLine', { bg = '#262b3d' })
 end
@@ -124,30 +125,42 @@ local function render(buf)
             }))
             mark(e.line, e.col, { virt_text = { { '}', 'RedlineBound' } }, virt_text_pos = 'inline' })
             mark(s.line, 0, { virt_text = meta, virt_text_pos = 'eol' })
-          elseif style == 'carets' then
-            -- A virtual line of ^ below the text, like a compiler message.
-            -- A range of more than one line also gets a line of v above it.
+          elseif style == 'lines' then
+            -- Like LSP virtual lines: an underline on the text, and below it
+            -- a colored line that starts at the text and holds the comment.
+            mark(s.line, s.col, vim.tbl_extend('force', sign, {
+              end_row = e.line,
+              end_col = e.col,
+              hl_group = 'RedlineUnderline',
+            }))
             local w = vim.fn.strdisplaywidth
-            local first = api.nvim_buf_get_lines(buf, s.line, s.line + 1, false)[1] or ''
             local last = api.nvim_buf_get_lines(buf, e.line, e.line + 1, false)[1] or ''
-            local gist = vim.split(t.body or '', '\n', { plain = true })[1]
-            local label = { (' #%d %s: %s'):format(t.id, t.author, gist), 'RedlineMeta' }
-            local pad = (' '):rep(w(first:sub(1, s.col)))
-            if s.line == e.line then
-              local n = math.max(1, w(first:sub(s.col + 1, e.col)))
-              mark(s.line, 0, vim.tbl_extend('force', sign, {
-                virt_lines = { { { pad .. ('^'):rep(n), 'RedlineBound' }, label } },
-              }))
-            else
-              local n = math.max(1, w(first:sub(s.col + 1)))
-              mark(s.line, 0, vim.tbl_extend('force', sign, {
-                virt_lines = { { { pad .. ('v'):rep(n), 'RedlineBound' } } },
-                virt_lines_above = true,
-              }))
-              mark(e.line, 0, {
-                virt_lines = { { { ('^'):rep(math.max(1, w(last:sub(1, e.col)))), 'RedlineBound' }, label } },
-              })
+            -- The line hangs from the start column, or from column 0 when the
+            -- comment ends on a later line than it starts.
+            local pad = s.line == e.line and w(last:sub(1, s.col)) or 0
+            local win = vim.fn.bufwinid(buf)
+            local info = win ~= -1 and vim.fn.getwininfo(win)[1]
+            local room = math.max(24, (info and (info.width - info.textoff) or 80) - pad - 7)
+            local text = ('#%d %s: %s'):format(t.id, t.author, (t.body or ''):gsub('%s+', ' '))
+            if #t.replies > 0 then
+              text = text .. ('  (%d %s)'):format(#t.replies, #t.replies == 1 and 'reply' or 'replies')
             end
+            local rows, cur = {}, ''
+            for word in text:gmatch('%S+') do
+              if cur ~= '' and w(cur) + 1 + w(word) > room then
+                rows[#rows + 1] = cur
+                cur = word
+              else
+                cur = cur == '' and word or (cur .. ' ' .. word)
+              end
+            end
+            rows[#rows + 1] = cur
+            local vl = {}
+            for i, row in ipairs(rows) do
+              local lead = (' '):rep(pad) .. (i == 1 and '└──── ' or '      ')
+              vl[#vl + 1] = { { lead .. row, 'RedlineBound' } }
+            end
+            mark(e.line, 0, { virt_lines = vl })
           else
             local group = t.kind == 'comment' and 'RedlineComment' or 'RedlineDelete'
             mark(s.line, s.col, vim.tbl_extend('force', sign, {
@@ -483,7 +496,7 @@ local function region(p1, p2, kind)
     p1, p2 = p2, p1
   end
   local lines = vim.fn.getregion(p1, p2, { type = linewise and 'V' or 'v' })
-  return { text = table.concat(lines, '\n'), line1 = p1[2], line2 = p2[2], linewise = linewise }
+  return { text = table.concat(lines, '\n'), line1 = p1[2], line2 = p2[2], col1 = p1[3], linewise = linewise }
 end
 
 local function line_region(l1, l2)
@@ -496,7 +509,9 @@ local function target_args(r)
   if r.linewise then
     return { '--lines', r.line1 == r.line2 and tostring(r.line1) or (r.line1 .. '-' .. r.line2) }
   end
-  return { '--text', r.text, '--near-line', tostring(r.line1) }
+  -- The line and the column pick the correct match when the text occurs
+  -- more than once.
+  return { '--text', r.text, '--near-line', tostring(r.line1), '--near-col', tostring(r.col1 or 1) }
 end
 
 local function where(r)
@@ -848,10 +863,10 @@ function M.history()
   api.nvim_win_set_cursor(0, { api.nvim_buf_line_count(b), 0 })
 end
 
--- Set how comments show their bounds: 'bg', 'brackets' or 'carets'. With no
+-- Set how comments show: 'bg', 'brackets' or 'lines'. With no
 -- name, go to the next style.
 function M.style(name)
-  local styles = { 'bg', 'brackets', 'carets' }
+  local styles = { 'bg', 'brackets', 'lines' }
   if not vim.tbl_contains(styles, name) then
     local i = vim.fn.index(styles, M.config.comment_style)
     name = styles[(i + 1) % #styles + 1]
@@ -916,7 +931,7 @@ function M.help()
       { p .. 't', 'thread list, as a buffer' },
       { p .. 'o', 'open the thread at the cursor as a buffer' },
       { p .. 'h', 'history of events' },
-      { p .. 's', 'next comment style: bg, brackets, carets' },
+      { p .. 's', 'next comment style: bg, brackets, lines' },
       { 'WRITE' },
       { ':w', 'a save records your edit' },
       { 'u', 'undo, also for an accept' },
