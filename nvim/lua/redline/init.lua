@@ -19,6 +19,7 @@ M.config = {
 -- per document buffer: { file, threads, watch, timer }
 local docs = {}
 local ICON = { comment = '●', edit = '~', insert = '+', delete = '-' }
+local PALETTE = { '#f0c674', '#7aa2f7', '#bb9af7', '#89c9d6', '#ffaa6e' }
 
 function M.setup(opts)
   M.config = vim.tbl_extend('force', M.config, opts or {})
@@ -37,8 +38,12 @@ local function hl()
   set('RedlineSignInsert', { fg = '#82d68c' })
   set('RedlineSignDelete', { fg = '#f0787c' })
   set('RedlineMeta', { link = 'Comment' })
-  set('RedlineBound', { fg = '#f0c674', bold = true })
-  set('RedlineUnderline', { underline = true, sp = '#f0c674' })
+  -- Comments that share lines get different colors: RedlineLine1..N for the
+  -- virtual text, RedlineUnderline1..N for the underline.
+  for i, c in ipairs(PALETTE) do
+    set('RedlineLine' .. i, { fg = c, bold = true })
+    set('RedlineUnderline' .. i, { underline = true, sp = c })
+  end
   set('RedlineFocus', { bg = '#46557f', bold = true })
   set('RedlineFocusLine', { bg = '#262b3d' })
 end
@@ -89,6 +94,31 @@ local function render(buf)
   local d = docs[buf]
   api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   local last = api.nvim_buf_line_count(buf) - 1
+
+  -- Give each comment a color that no comment on the same lines has.
+  local color, placed = {}, {}
+  local comments = vim.tbl_filter(function(t)
+    return t.kind == 'comment' and has_range(t)
+  end, d.threads)
+  table.sort(comments, function(a, b)
+    local x, y = a.range.start, b.range.start
+    return x.line < y.line or (x.line == y.line and x.col < y.col)
+  end)
+  for _, t in ipairs(comments) do
+    local used = {}
+    for _, o in ipairs(placed) do
+      if o.range.start.line <= t.range['end'].line and t.range.start.line <= o.range['end'].line then
+        used[color[o.id]] = true
+      end
+    end
+    local c = 1
+    while used[c] and c <= #PALETTE do
+      c = c + 1
+    end
+    color[t.id] = c <= #PALETTE and c or (#placed % #PALETTE + 1)
+    placed[#placed + 1] = t
+  end
+
   for _, t in ipairs(d.threads) do
     if has_range(t) then
       local s, e = t.range.start, t.range['end']
@@ -113,17 +143,18 @@ local function render(buf)
           }))
         else
           local style = t.kind == 'comment' and M.config.comment_style or 'bg'
+          local line_hl = 'RedlineLine' .. (color[t.id] or 1)
           local mark = function(row, col, opts)
             api.nvim_buf_set_extmark(buf, ns, row, col, opts)
           end
           if style == 'brackets' then
             -- Virtual braces around the text.
             mark(s.line, s.col, vim.tbl_extend('force', sign, {
-              virt_text = { { '{', 'RedlineBound' } },
+              virt_text = { { '{', line_hl } },
               virt_text_pos = 'inline',
               right_gravity = false,
             }))
-            mark(e.line, e.col, { virt_text = { { '}', 'RedlineBound' } }, virt_text_pos = 'inline' })
+            mark(e.line, e.col, { virt_text = { { '}', line_hl } }, virt_text_pos = 'inline' })
             mark(s.line, 0, { virt_text = meta, virt_text_pos = 'eol' })
           elseif style == 'lines' then
             -- Like LSP virtual lines: an underline on the text, and below it
@@ -131,7 +162,7 @@ local function render(buf)
             mark(s.line, s.col, vim.tbl_extend('force', sign, {
               end_row = e.line,
               end_col = e.col,
-              hl_group = 'RedlineUnderline',
+              hl_group = 'RedlineUnderline' .. (color[t.id] or 1),
             }))
             local w = vim.fn.strdisplaywidth
             local last = api.nvim_buf_get_lines(buf, e.line, e.line + 1, false)[1] or ''
@@ -158,7 +189,7 @@ local function render(buf)
             local vl = {}
             for i, row in ipairs(rows) do
               local lead = (' '):rep(pad) .. (i == 1 and '└──── ' or '      ')
-              vl[#vl + 1] = { { lead .. row, 'RedlineBound' } }
+              vl[#vl + 1] = { { lead .. row, line_hl } }
             end
             mark(e.line, 0, { virt_lines = vl })
           else
