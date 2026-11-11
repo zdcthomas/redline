@@ -1,10 +1,14 @@
-//! redline as a native window. It shows the same state as the TUI and the
-//! Neovim plugin: the fold of the event log. The human reviews proposals and
-//! comments with the keyboard, and edits blocks in a text box.
+//! redline as a native window, for people who do not live in a terminal.
+//!
+//! It looks and works like a document editor: a page, a comment column, and
+//! buttons. Click a paragraph to edit it, select words to comment on them,
+//! and press Accept or Reject on a suggestion. There are no modes and no
+//! key commands to learn. It shows the same state as the TUI and the Neovim
+//! plugin: the fold of the event log.
 
 use eframe::egui::{
-    self, Align, Align2, Color32, FontFamily, FontId, Frame, Key, Margin, RichText, Sense, Stroke, TextFormat,
-    text::LayoutJob,
+    self, Align, Color32, CursorIcon, FontFamily, FontId, Frame, Key, Margin, RichText, Sense, Stroke, TextFormat,
+    text::{CCursor, CCursorRange, LayoutJob},
 };
 use redline::anchor;
 use redline::ops::Session;
@@ -12,46 +16,48 @@ use redline::store::{Kind, Thread, ago};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-const BG: Color32 = Color32::from_rgb(20, 22, 29);
-const BAR: Color32 = Color32::from_rgb(24, 26, 34);
-const CURSOR_BG: Color32 = Color32::from_rgb(34, 38, 50);
-const BLOCK_BG: Color32 = Color32::from_rgb(26, 29, 38);
-const TEXT: Color32 = Color32::from_rgb(214, 220, 232);
-const DIM: Color32 = Color32::from_rgb(120, 128, 150);
-const FAINT: Color32 = Color32::from_rgb(70, 76, 96);
-const ACCENT: Color32 = Color32::from_rgb(255, 92, 87);
-const ADD: Color32 = Color32::from_rgb(130, 214, 140);
-const ADD_BG: Color32 = Color32::from_rgb(28, 54, 38);
-const DEL: Color32 = Color32::from_rgb(240, 120, 124);
-const DEL_BG: Color32 = Color32::from_rgb(64, 30, 36);
-const NOTE_BG: Color32 = Color32::from_rgb(58, 50, 24);
-const AGENT: Color32 = Color32::from_rgb(187, 154, 247);
-const HUMAN: Color32 = Color32::from_rgb(122, 162, 247);
-const CODE: Color32 = Color32::from_rgb(137, 201, 214);
-const H2: Color32 = Color32::from_rgb(255, 170, 110);
-/// Comments that share lines get different colors.
-const PALETTE: [Color32; 5] = [
-    Color32::from_rgb(240, 198, 116),
-    Color32::from_rgb(122, 162, 247),
-    Color32::from_rgb(187, 154, 247),
-    Color32::from_rgb(137, 201, 214),
-    Color32::from_rgb(255, 170, 110),
+// A light document look.
+const DESK: Color32 = Color32::from_rgb(241, 243, 246);
+const PAPER: Color32 = Color32::from_rgb(255, 255, 255);
+const RULE: Color32 = Color32::from_rgb(222, 226, 232);
+const INK: Color32 = Color32::from_rgb(36, 41, 48);
+const STRONG: Color32 = Color32::from_rgb(12, 14, 18);
+const MUTED: Color32 = Color32::from_rgb(106, 115, 128);
+const BRAND: Color32 = Color32::from_rgb(207, 52, 48);
+const LINK: Color32 = Color32::from_rgb(38, 99, 196);
+const ADD: Color32 = Color32::from_rgb(22, 112, 52);
+const ADD_BG: Color32 = Color32::from_rgb(220, 247, 227);
+const ADD_BG_ON: Color32 = Color32::from_rgb(178, 235, 195);
+const DEL: Color32 = Color32::from_rgb(190, 38, 46);
+const DEL_BG: Color32 = Color32::from_rgb(255, 232, 230);
+const DEL_BG_ON: Color32 = Color32::from_rgb(255, 205, 201);
+const CODE_BG: Color32 = Color32::from_rgb(240, 242, 245);
+const EDIT_BG: Color32 = Color32::from_rgb(248, 250, 255);
+const CARD_ON: Color32 = Color32::from_rgb(255, 250, 235);
+const AI: Color32 = Color32::from_rgb(120, 76, 196);
+/// Highlight colors for comments: (normal, selected). Comments that share
+/// lines get different colors.
+const TINTS: [(Color32, Color32); 5] = [
+    (Color32::from_rgb(255, 242, 189), Color32::from_rgb(255, 221, 110)),
+    (Color32::from_rgb(214, 232, 255), Color32::from_rgb(170, 207, 255)),
+    (Color32::from_rgb(234, 221, 255), Color32::from_rgb(209, 184, 255)),
+    (Color32::from_rgb(207, 243, 239), Color32::from_rgb(160, 228, 220)),
+    (Color32::from_rgb(255, 227, 205), Color32::from_rgb(255, 199, 153)),
 ];
 
-fn kind_color(k: Kind) -> Color32 {
-    match k {
-        Kind::Comment => PALETTE[0],
-        Kind::Edit => H2,
-        Kind::Insert => ADD,
-        Kind::Delete => DEL,
-    }
+fn body(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Proportional)
 }
-fn kind_icon(k: Kind) -> &'static str {
+fn mono(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Monospace)
+}
+
+fn kind_label(k: Kind) -> (&'static str, Color32) {
     match k {
-        Kind::Comment => "●",
-        Kind::Edit => "~",
-        Kind::Insert => "+",
-        Kind::Delete => "−",
+        Kind::Comment => ("Comment", Color32::from_rgb(150, 110, 0)),
+        Kind::Edit => ("Suggested edit", LINK),
+        Kind::Insert => ("Suggested addition", ADD),
+        Kind::Delete => ("Suggested deletion", DEL),
     }
 }
 
@@ -59,46 +65,60 @@ fn kind_icon(k: Kind) -> &'static str {
 struct Mark {
     id: u64,
     kind: Kind,
-    /// Text that the thread covers.
     range: Range<usize>,
     /// Proposed text, shown at this offset.
     inject: Option<(usize, String)>,
-    color: Color32,
+    tint: usize,
 }
 
-enum Purpose {
-    Comment { quote: String, line: usize },
-    Reply(u64),
-    Reject(u64),
-    Modify(u64),
-    Edit(Range<usize>),
-    NewBlock { after: Option<usize> },
-}
-
-struct Dialog {
-    title: String,
-    hint: &'static str,
+/// The paragraph that the person edits now.
+struct Editing {
+    /// The text that this edit replaces. Empty for a new paragraph.
+    range: Range<usize>,
+    /// For a new paragraph: the line that it goes after (`None` = top).
+    new_after: Option<Option<usize>>,
     text: String,
     initial: String,
-    purpose: Purpose,
-    /// A dialog shows from the frame after the key that opened it, so that
-    /// the key does not land in the text box.
-    fresh: bool,
+    /// Put the text cursor at this screen position (from the click).
+    place: Option<egui::Pos2>,
+    focus: bool,
+    /// Selected bytes of `text`.
+    sel: Option<Range<usize>>,
+}
+
+struct Composer {
+    quote: String,
+    line: usize,
+    col: usize,
+    text: String,
+    focus: bool,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Comments,
+    Activity,
+}
+
+enum Act {
+    Edit(Range<usize>, Option<egui::Pos2>),
+    New(Option<usize>),
+    Commit,
+    Comment,
 }
 
 struct App {
     s: Session,
-    /// (session version, marks, first line of each open thread).
+    /// (session version, marks, (thread, first line) in document order).
     marks: (u64, Vec<Mark>, Vec<(u64, Option<usize>)>),
-    cursor: usize,
-    sel: Option<usize>,
     active: Option<u64>,
-    dialog: Option<Dialog>,
+    editing: Option<Editing>,
+    composer: Option<Composer>,
+    reply: Option<(u64, String)>,
+    reject: Option<(u64, String)>,
+    tab: Tab,
     flash: Option<(String, Instant, bool)>,
-    history: bool,
-    help: bool,
-    pending: Option<char>,
-    /// Scroll the document / the thread list to the current item once.
+    /// Scroll the page / the comment column to the selected thread once.
     reveal: (bool, bool),
     last_poll: Instant,
     seen_max: u64,
@@ -120,52 +140,61 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(format!("redline — {name}"))
+            .with_title(format!("{name} — redline"))
             .with_app_id("redline")
-            .with_inner_size([1240.0, 860.0]),
+            .with_inner_size([1280.0, 880.0]),
         ..Default::default()
     };
     eframe::run_native(
         "redline",
         options,
         Box::new(move |cc| {
-            let mut v = egui::Visuals::dark();
-            v.panel_fill = BG;
-            v.window_fill = BAR;
-            v.override_text_color = Some(TEXT);
-            v.extreme_bg_color = Color32::from_rgb(14, 15, 20);
-            v.selection.bg_fill = Color32::from_rgb(48, 58, 88);
+            cc.egui_ctx.set_theme(egui::Theme::Light);
+            let mut v = egui::Visuals::light();
+            v.panel_fill = DESK;
+            v.window_fill = PAPER;
+            v.override_text_color = Some(INK);
+            v.extreme_bg_color = PAPER;
+            v.selection.bg_fill = Color32::from_rgb(188, 214, 255);
+            v.selection.stroke = Stroke::new(1.0, LINK);
+            v.widgets.inactive.corner_radius = 6.0.into();
+            v.widgets.hovered.corner_radius = 6.0.into();
+            v.widgets.active.corner_radius = 6.0.into();
             cc.egui_ctx.set_visuals(v);
+            cc.egui_ctx.all_styles_mut(|st| {
+                st.spacing.button_padding = egui::vec2(10.0, 5.0);
+                st.spacing.item_spacing = egui::vec2(8.0, 6.0);
+                for (style, font) in st.text_styles.iter_mut() {
+                    font.size = match style {
+                        egui::TextStyle::Heading => 22.0,
+                        egui::TextStyle::Small => 12.0,
+                        egui::TextStyle::Monospace => 13.5,
+                        _ => 14.5,
+                    };
+                }
+            });
             let seen_max = s.state.threads.iter().map(|t| t.id).max().unwrap_or(0);
             let mut app = App {
                 s,
                 marks: (0, vec![], vec![]),
-                cursor: 0,
-                sel: None,
                 active: None,
-                dialog: None,
+                editing: None,
+                composer: None,
+                reply: None,
+                reject: None,
+                tab: Tab::Comments,
                 flash: None,
-                history: false,
-                help: false,
-                pending: None,
-                reveal: (true, true),
+                reveal: (false, false),
                 last_poll: Instant::now(),
                 seen_max,
             };
-            app.sync_active();
+            app.refresh();
             Ok(Box::new(app))
         }),
     )
-}
-
-fn body_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Proportional)
-}
-fn mono(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Monospace)
 }
 
 impl App {
@@ -177,10 +206,14 @@ impl App {
     fn fail(&mut self, e: anyhow::Error) {
         self.flash = Some((format!("{e:#}"), Instant::now(), true));
     }
-
-    fn lines(&self) -> Vec<Range<usize>> {
-        let n = anchor::line_starts(&self.s.doc).len();
-        (0..n).map(|i| anchor::lines_range(&self.s.doc, i, i)).collect()
+    fn done(&mut self, r: anyhow::Result<()>, ok: &str) {
+        match r {
+            Ok(()) => {
+                self.refresh();
+                self.say(ok);
+            }
+            Err(e) => self.fail(e),
+        }
     }
 
     /// Find the marks again after the state or the text changed.
@@ -191,43 +224,40 @@ impl App {
         let doc = &self.s.doc;
         let mut marks: Vec<Mark> = vec![];
         let mut places = vec![];
+        let lines = |m: &Range<usize>| anchor::line_of(doc, m.start)..=anchor::line_of(doc, m.end);
         for (t, r) in self.s.open_threads() {
             places.push((t.id, r.as_ref().map(|r| anchor::line_of(doc, r.start))));
             let Some(r) = r else { continue };
-            let lines = |m: &Range<usize>| anchor::line_of(doc, m.start)..=anchor::line_of(doc, m.end);
             match t.kind {
                 Kind::Insert => {
                     let gap = if t.tight { "" } else { "\n" };
                     let text = if t.quote.is_empty() { format!("{}\n{gap}", t.new) } else { format!("\n{gap}{}", t.new) };
-                    marks.push(Mark { id: t.id, kind: t.kind, range: r.end..r.end, inject: Some((r.end, text)), color: ADD });
+                    marks.push(Mark { id: t.id, kind: t.kind, range: r.end..r.end, inject: Some((r.end, text)), tint: 0 });
                 }
                 Kind::Comment => {
-                    // A color that no comment on the same lines has.
                     let mine = lines(&r);
-                    let used: Vec<Color32> = marks
+                    let used: Vec<usize> = marks
                         .iter()
                         .filter(|m| m.kind == Kind::Comment)
                         .filter(|m| {
                             let o = lines(&m.range);
                             o.start() <= mine.end() && mine.start() <= o.end()
                         })
-                        .map(|m| m.color)
+                        .map(|m| m.tint)
                         .collect();
-                    let color = PALETTE.iter().copied().find(|c| !used.contains(c)).unwrap_or(PALETTE[marks.len() % PALETTE.len()]);
-                    marks.push(Mark { id: t.id, kind: t.kind, range: r, inject: None, color });
+                    let tint = (0..TINTS.len()).find(|c| !used.contains(c)).unwrap_or(marks.len() % TINTS.len());
+                    marks.push(Mark { id: t.id, kind: t.kind, range: r, inject: None, tint });
                 }
                 _ => {
                     let clash = marks.iter().any(|m| m.kind != Kind::Comment && m.range.start < r.end && r.start < m.range.end);
                     if !clash {
                         let inject = (t.kind == Kind::Edit).then(|| (r.end, t.new.clone()));
-                        marks.push(Mark { id: t.id, kind: t.kind, range: r, inject, color: DEL });
+                        marks.push(Mark { id: t.id, kind: t.kind, range: r, inject, tint: 0 });
                     }
                 }
             }
         }
         self.marks = (self.s.version, marks, places);
-        let n = self.lines().len();
-        self.cursor = self.cursor.min(n - 1);
         if self.active.is_some_and(|a| !self.marks.2.iter().any(|p| p.0 == a)) {
             self.active = None;
         }
@@ -237,327 +267,107 @@ impl App {
         self.s.state.threads.iter().find(|t| t.id == id)
     }
 
-    fn threads_on(&self, line: usize) -> Vec<u64> {
+    /// Save the paragraph that the person edits.
+    fn commit(&mut self) {
+        let Some(ed) = self.editing.take() else { return };
+        let text = ed.text.trim_end().to_string();
+        if text == ed.initial {
+            return;
+        }
         let doc = &self.s.doc;
-        self.marks
-            .1
-            .iter()
-            .filter(|m| (anchor::line_of(doc, m.range.start)..=anchor::line_of(doc, m.range.end)).contains(&line))
-            .map(|m| m.id)
-            .collect()
-    }
-
-    fn sync_active(&mut self) {
-        self.refresh();
-        let here = self.threads_on(self.cursor);
-        if !self.active.is_some_and(|a| here.contains(&a)) {
-            self.active = here.first().copied();
-            self.reveal.1 = true;
-        }
-    }
-
-    fn move_to(&mut self, line: usize) {
-        self.cursor = line.min(self.lines().len() - 1);
-        self.reveal.0 = true;
-        self.sync_active();
-    }
-
-    fn block_at(&self, line: usize) -> Option<(usize, usize)> {
-        anchor::blocks(&self.s.doc).into_iter().find(|(a, b)| (*a..=*b).contains(&line))
-    }
-
-    /// The lines an action applies to: the selection, or the block at the cursor.
-    fn target(&self) -> Option<(usize, usize)> {
-        match self.sel {
-            Some(s) => Some((s.min(self.cursor), s.max(self.cursor))),
-            None => self.block_at(self.cursor),
-        }
-    }
-
-    fn step_thread(&mut self, fwd: bool) {
-        let order = &self.marks.2;
-        if order.is_empty() {
-            return self.say("no open threads");
-        }
-        let i = self.active.and_then(|a| order.iter().position(|p| p.0 == a));
-        let next = match i {
-            Some(i) if fwd => (i + 1) % order.len(),
-            Some(i) => (i + order.len() - 1) % order.len(),
-            None if fwd => order.iter().position(|p| p.1.is_some_and(|l| l >= self.cursor)).unwrap_or(0),
-            None => order.iter().rposition(|p| p.1.is_some_and(|l| l <= self.cursor)).unwrap_or(order.len() - 1),
+        let r = match ed.new_after {
+            Some(after) => {
+                if text.trim().is_empty() {
+                    return;
+                }
+                let (r, t) = anchor::block_insert(doc, after, &text);
+                self.s.edit(r, &t, "new")
+            }
+            None if text.trim().is_empty() => {
+                let (l0, l1) = (anchor::line_of(doc, ed.range.start), anchor::line_of(doc, ed.range.end));
+                let (r, t) = anchor::delete_lines(doc, l0, l1);
+                self.s.edit(r, &t, "delete")
+            }
+            None => self.s.edit(ed.range, &text, "edit"),
         };
-        let (id, line) = order[next];
-        if let Some(l) = line {
-            self.cursor = l;
+        self.done(r, "Saved");
+    }
+
+    /// Start a comment on the selected words, or on the full paragraph.
+    fn start_comment(&mut self) {
+        let Some(ed) = &self.editing else {
+            return self.say("Click in a paragraph first. Select words to comment on only those words.");
+        };
+        if ed.new_after.is_some() {
+            return self.say("Finish the new paragraph first.");
         }
-        self.sel = None;
-        self.active = Some(id);
-        self.reveal = (true, true);
-    }
-
-    fn open(&mut self, title: String, hint: &'static str, text: String, purpose: Purpose) {
-        self.dialog = Some(Dialog { title, hint, initial: text.clone(), text, purpose, fresh: true });
-    }
-
-    // ── actions ──────────────────────────────────────────────────────────
-
-    fn after(&mut self, r: anyhow::Result<()>, ok: String) {
-        match r {
-            Ok(()) => {
-                self.sync_active();
-                self.say(ok);
-            }
-            Err(e) => self.fail(e),
+        let text = ed.text.trim_end();
+        let sel = ed.sel.clone().filter(|s| !s.is_empty() && s.end <= text.len());
+        let (a, b) = sel.map(|s| (s.start, s.end)).unwrap_or((0, text.len()));
+        let quote = text[a..b].trim_matches('\n').to_string();
+        if quote.trim().is_empty() {
+            return self.say("There is no text to comment on.");
         }
+        let start = ed.range.start + a + (text[a..b].len() - text[a..b].trim_start_matches('\n').len());
+        self.commit();
+        let (line, col) = anchor::pos(&self.s.doc, start);
+        self.tab = Tab::Comments;
+        self.composer = Some(Composer { quote, line, col, text: String::new(), focus: true });
     }
 
-    fn accept(&mut self, id: u64, changed: Option<String>) {
-        match self.s.accept(id, changed) {
-            Ok(line) => {
-                self.move_to(line);
-                self.say(format!("accepted #{id}  ·  u to undo"));
-            }
-            Err(e) => self.fail(e),
-        }
-    }
-
-    fn submit(&mut self, d: Dialog) {
-        let text = d.text.trim_end().to_string();
-        let body = text.trim().to_string();
-        match d.purpose {
-            Purpose::Comment { quote, line } => {
-                if body.is_empty() {
-                    return self.say("empty comment: not added");
-                }
-                match self.s.comment(quote, line, 0, body) {
-                    Ok(id) => {
-                        self.sel = None;
-                        self.seen_max = self.seen_max.max(id);
-                        self.refresh();
-                        self.active = Some(id);
-                        self.reveal.1 = true;
-                        self.say(format!("comment #{id} added"));
-                    }
-                    Err(e) => self.fail(e),
-                }
-            }
-            Purpose::Reply(id) => {
-                if !body.is_empty() {
-                    let r = self.s.reply(id, body);
-                    self.after(r, format!("replied on #{id}"));
-                }
-            }
-            Purpose::Reject(id) => {
-                let r = self.s.reject(id, (!body.is_empty()).then_some(body));
-                self.after(r, format!("rejected #{id}"));
-            }
-            Purpose::Modify(id) => {
-                if text == d.initial {
-                    self.say("no change  ·  a accepts the proposal as it is");
+    fn act(&mut self, a: Act) {
+        match a {
+            Act::Commit => self.commit(),
+            Act::Comment => self.start_comment(),
+            Act::Edit(range, place) => {
+                self.commit();
+                // The commit can move the text: find the paragraph at the click again.
+                let doc = &self.s.doc;
+                let range = if range.end <= doc.len() && doc.is_char_boundary(range.start) && doc.is_char_boundary(range.end) {
+                    range
                 } else {
-                    self.accept(id, Some(text));
-                }
-            }
-            Purpose::Edit(range) => {
-                if text == d.initial {
-                    return self.say("no change");
-                }
-                let l0 = anchor::line_of(&self.s.doc, range.start);
-                let r = if body.is_empty() {
-                    let l1 = anchor::line_of(&self.s.doc, range.end);
-                    let (r, t) = anchor::delete_lines(&self.s.doc, l0, l1);
-                    self.s.edit(r, &t, "delete")
-                } else {
-                    self.s.edit(range, &text, "edit")
+                    return;
                 };
-                self.sel = None;
-                self.after(r, "saved  ·  u to undo".into());
-                self.move_to(l0);
+                let text = doc[range.clone()].to_string();
+                let line = anchor::line_of(doc, range.start);
+                let end = anchor::line_of(doc, range.end);
+                if let Some(m) = self.marks.1.iter().find(|m| {
+                    let l = anchor::line_of(doc, m.range.start);
+                    (line..=end).contains(&l)
+                }) {
+                    self.active = Some(m.id);
+                    self.reveal.1 = true;
+                }
+                self.editing = Some(Editing { range, new_after: None, initial: text.clone(), text, place, focus: true, sel: None });
             }
-            Purpose::NewBlock { after } => {
-                if body.is_empty() {
-                    return self.say("empty block: nothing added");
-                }
-                let (r, t) = anchor::block_insert(&self.s.doc, after, &text);
-                let pos = r.start + t.len() - t.trim_start_matches('\n').len();
-                let res = self.s.edit(r, &t, "new");
-                self.after(res, "block added  ·  u to undo".into());
-                let line = anchor::line_of(&self.s.doc, pos);
-                self.move_to(line);
-            }
-        }
-    }
-
-    fn key_char(&mut self, c: char) {
-        let pending = self.pending.take();
-        let last = self.lines().len() - 1;
-        let active = self.active.and_then(|a| self.thread(a)).cloned();
-        let none = "no thread here  ·  n goes to the next thread";
-        match c {
-            'j' => self.move_to(self.cursor + 1),
-            'k' => self.move_to(self.cursor.saturating_sub(1)),
-            'g' if pending == Some('g') => self.move_to(0),
-            'g' => self.pending = Some('g'),
-            'G' => self.move_to(last),
-            '}' => {
-                let next = anchor::blocks(&self.s.doc).iter().find(|b| b.0 > self.cursor).map(|b| b.0).unwrap_or(last);
-                self.move_to(next);
-            }
-            '{' => {
-                let prev = anchor::blocks(&self.s.doc).iter().rev().find(|b| b.0 < self.cursor).map(|b| b.0).unwrap_or(0);
-                self.move_to(prev);
-            }
-            'n' | ']' => self.step_thread(true),
-            'N' | '[' => self.step_thread(false),
-            'v' | 'V' => self.sel = if self.sel.is_some() { None } else { Some(self.cursor) },
-            'd' if self.sel.is_some() || pending == Some('d') => match self.target() {
-                Some((l0, l1)) => {
-                    let (r, t) = anchor::delete_lines(&self.s.doc, l0, l1);
-                    let res = self.s.edit(r, &t, "delete");
-                    self.sel = None;
-                    self.after(res, format!("deleted {} lines  ·  u to undo", l1 - l0 + 1));
-                    self.move_to(l0);
-                }
-                None => self.say("nothing to delete here"),
-            },
-            'd' => self.pending = Some('d'),
-            'e' => match self.target() {
-                Some((l0, l1)) => {
-                    let range = anchor::lines_range(&self.s.doc, l0, l1);
-                    let text = self.s.doc[range.clone()].to_string();
-                    let title = if l0 == l1 { format!("Edit L{}", l0 + 1) } else { format!("Edit L{}–{}", l0 + 1, l1 + 1) };
-                    self.open(title, "", text, Purpose::Edit(range));
-                }
-                None => {
-                    let after = self.cursor.checked_sub(1);
-                    self.open("New block".into(), "", String::new(), Purpose::NewBlock { after });
-                }
-            },
-            'o' => {
-                let after = Some(self.target().map(|t| t.1).unwrap_or(self.cursor));
-                self.open("New block".into(), "", String::new(), Purpose::NewBlock { after });
-            }
-            'O' => {
-                let after = self.target().map(|t| t.0).unwrap_or(self.cursor).checked_sub(1);
-                self.open("New block".into(), "", String::new(), Purpose::NewBlock { after });
-            }
-            'c' => match self.target() {
-                Some((l0, l1)) => {
-                    let quote = self.s.doc[anchor::lines_range(&self.s.doc, l0, l1)].to_string();
-                    let title = if l0 == l1 { format!("Comment on L{}", l0 + 1) } else { format!("Comment on L{}–{}", l0 + 1, l1 + 1) };
-                    self.open(title, "", String::new(), Purpose::Comment { quote, line: l0 });
-                }
-                None => self.say("no text to comment on"),
-            },
-            'a' => match active {
-                Some(t) if t.kind.is_proposal() => self.accept(t.id, None),
-                Some(_) => self.say("a comment has nothing to accept: R resolves it"),
-                None => self.say(none),
-            },
-            'x' => match active {
-                Some(t) if t.kind.is_proposal() => {
-                    self.open(format!("Reject #{}", t.id), "reason (optional): the agent reads it", String::new(), Purpose::Reject(t.id));
-                }
-                Some(_) => self.say("R resolves a comment"),
-                None => self.say(none),
-            },
-            'm' => match active {
-                Some(t) if matches!(t.kind, Kind::Edit | Kind::Insert) => {
-                    self.open(format!("Change #{}, then accept", t.id), "", t.new.clone(), Purpose::Modify(t.id));
-                }
-                Some(_) => self.say("only an edit or an insert has text to change"),
-                None => self.say(none),
-            },
-            'r' => match active {
-                Some(t) => self.open(format!("Reply on #{}", t.id), "", String::new(), Purpose::Reply(t.id)),
-                None => self.say(none),
-            },
-            'R' => match active {
-                Some(t) if t.kind == Kind::Comment => {
-                    let r = self.s.resolve(t.id);
-                    self.after(r, format!("resolved #{}", t.id));
-                }
-                Some(_) => self.say("a proposal needs a decision: a accept, x reject"),
-                None => self.say(none),
-            },
-            'u' => match self.s.undo() {
-                Ok(true) => {
-                    self.sync_active();
-                    self.say("undone");
-                }
-                Ok(false) => self.say("nothing to undo"),
-                Err(e) => self.fail(e),
-            },
-            'H' => self.history = !self.history,
-            '?' => self.help = true,
-            _ => {}
-        }
-    }
-
-    fn keys(&mut self, ui: &egui::Ui) {
-        let events = ui.input(|i| i.events.clone());
-        for ev in events {
-            if self.dialog.is_some() {
-                return;
-            }
-            if self.help {
-                if matches!(ev, egui::Event::Text(_) | egui::Event::Key { pressed: true, .. }) {
-                    self.help = false;
-                }
-                continue;
-            }
-            match ev {
-                egui::Event::Text(t) => {
-                    self.flash = None;
-                    if self.history {
-                        if t == "H" || t == "q" {
-                            self.history = false;
-                        }
-                        continue;
-                    }
-                    for c in t.chars() {
-                        self.key_char(c);
-                    }
-                }
-                egui::Event::Key { key, pressed: true, modifiers, .. } => match key {
-                    Key::Escape => {
-                        self.sel = None;
-                        self.history = false;
-                        self.flash = None;
-                    }
-                    Key::ArrowDown => self.move_to(self.cursor + 1),
-                    Key::ArrowUp => self.move_to(self.cursor.saturating_sub(1)),
-                    Key::PageDown => self.move_to(self.cursor + 15),
-                    Key::PageUp => self.move_to(self.cursor.saturating_sub(15)),
-                    Key::D if modifiers.ctrl => self.move_to(self.cursor + 10),
-                    Key::U if modifiers.ctrl => self.move_to(self.cursor.saturating_sub(10)),
-                    Key::Enter => self.key_char('e'),
-                    Key::Tab => {
-                        let here = self.threads_on(self.cursor);
-                        if !here.is_empty() {
-                            let i = self.active.and_then(|a| here.iter().position(|x| *x == a)).map(|i| i + 1).unwrap_or(0);
-                            self.active = Some(here[i % here.len()]);
-                            self.reveal.1 = true;
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {}
+            Act::New(after) => {
+                self.commit();
+                let at = match after {
+                    Some(l) => anchor::lines_range(&self.s.doc, l, l).end,
+                    None => 0,
+                };
+                self.editing = Some(Editing {
+                    range: at..at,
+                    new_after: Some(after),
+                    text: String::new(),
+                    initial: String::new(),
+                    place: None,
+                    focus: true,
+                    sel: None,
+                });
             }
         }
     }
 
-    // ── drawing ──────────────────────────────────────────────────────────
+    // ── the page ─────────────────────────────────────────────────────────
 
-    /// One source line as styled text, with the marks of the threads.
-    fn line_job(&self, r: &Range<usize>, fence: &mut bool, width: f32) -> LayoutJob {
+    /// Add one source line to `job` as formatted text. Markdown marks are
+    /// not shown: a heading is large text, a list item gets a bullet.
+    fn add_line(&self, job: &mut LayoutJob, r: &Range<usize>, fence: &mut bool) {
         let doc = &self.s.doc;
         let text = &doc[r.clone()];
         let t = text.trim_start();
-        let mut job = LayoutJob::default();
-        job.wrap.max_width = width;
-
-        // base format of the line
+        let indent = text.len() - t.len();
         let is_fence = t.starts_with("```") || t.starts_with("~~~");
         let code_line = *fence || is_fence;
         if is_fence {
@@ -565,22 +375,34 @@ impl App {
         }
         let hashes = t.chars().take_while(|c| *c == '#').count();
         let heading = !code_line && (1..=6).contains(&hashes) && t[hashes..].starts_with(' ');
+        let mut skip = r.start;
         let base = if code_line {
-            TextFormat { font_id: mono(14.0), color: if is_fence { FAINT } else { CODE }, ..Default::default() }
+            TextFormat { font_id: mono(13.5), color: if is_fence { MUTED } else { INK }, background: CODE_BG, ..Default::default() }
         } else if heading {
-            let (size, color) = match hashes {
-                1 => (27.0, ACCENT),
-                2 => (21.0, H2),
-                _ => (17.5, HUMAN),
+            skip = r.start + indent + hashes + 1;
+            let size = match hashes {
+                1 => 30.0,
+                2 => 22.0,
+                _ => 18.0,
             };
-            TextFormat { font_id: body_font(size), color, ..Default::default() }
+            TextFormat { font_id: body(size), color: STRONG, ..Default::default() }
         } else if t.starts_with('>') {
-            TextFormat { font_id: body_font(15.5), color: DIM, italics: true, ..Default::default() }
+            skip = r.start + indent + 1 + t[1..].starts_with(' ') as usize;
+            TextFormat { font_id: body(16.0), color: MUTED, italics: true, ..Default::default() }
         } else {
-            TextFormat { font_id: body_font(15.5), color: TEXT, ..Default::default() }
+            TextFormat { font_id: body(16.0), color: INK, line_height: Some(25.0), ..Default::default() }
         };
+        if !code_line && !heading {
+            let tb = t.as_bytes();
+            if tb.len() >= 2 && matches!(tb[0], b'-' | b'*' | b'+') && tb[1] == b' ' {
+                skip = r.start + indent + 2;
+                let rest = &t[2..];
+                // A task item keeps its box: the bullet goes away.
+                let bullet = if rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ") { "" } else { "•  " };
+                job.append(&format!("{}  {bullet}", &text[..indent]), 0.0, TextFormat { color: BRAND, ..base.clone() });
+            }
+        }
 
-        // split the line where marks start and stop
         let here: Vec<&Mark> = self.marks.1.iter().filter(|m| m.range.start <= r.end && r.start <= m.range.end).collect();
         let mut cuts: Vec<usize> = vec![r.start, r.end];
         for m in &here {
@@ -595,351 +417,485 @@ impl App {
                     if *pos == at {
                         let on = self.active == Some(m.id);
                         let f = TextFormat {
-                            font_id: base.font_id.clone(),
+                            font_id: if new.contains('\n') { body(16.0) } else { base.font_id.clone() },
                             color: ADD,
-                            background: if on { ADD_BG } else { Color32::TRANSPARENT },
+                            background: if on { ADD_BG_ON } else { ADD_BG },
+                            line_height: base.line_height,
                             ..Default::default()
                         };
-                        job.append(new, 0.0, f);
+                        // show list items of the new text with a bullet, as on the page
+                        let shown: Vec<String> = new
+                            .split('\n')
+                            .map(|l| match l.strip_prefix("- ").or(l.strip_prefix("* ")) {
+                                Some(rest) => format!("  •  {rest}"),
+                                None => l.to_string(),
+                            })
+                            .collect();
+                        job.append(&shown.join("\n"), 0.0, f);
                     }
                 }
             }
         };
-        let mut in_code = false;
+        let (mut in_code, mut strong) = (false, false);
         for w in cuts.windows(2) {
             let (a, b) = (w[0], w[1]);
-            inject(&mut job, a);
+            inject(job, a);
+            let a = a.max(skip);
+            if a >= b {
+                continue;
+            }
             let mut f = base.clone();
-            // a proposal wins over a comment on the same text
+            // a suggestion wins over a comment on the same text
             let cover = |k: fn(Kind) -> bool| here.iter().find(|m| k(m.kind) && m.range.start <= a && b <= m.range.end && !m.range.is_empty());
             if let Some(m) = cover(|k| k != Kind::Comment) {
                 f.color = DEL;
                 f.strikethrough = Stroke::new(1.0, DEL);
-                if self.active == Some(m.id) {
-                    f.background = DEL_BG;
-                }
+                f.background = if self.active == Some(m.id) { DEL_BG_ON } else { DEL_BG };
             } else if let Some(m) = cover(|k| k == Kind::Comment) {
-                f.underline = Stroke::new(1.5, m.color);
-                if self.active == Some(m.id) {
-                    f.background = NOTE_BG;
-                }
+                let (normal, on) = TINTS[m.tint];
+                f.background = if self.active == Some(m.id) { on } else { normal };
             }
-            // inline `code`
+            if code_line {
+                job.append(&doc[a..b], 0.0, f);
+                continue;
+            }
+            // `code` and **strong**, with the marks hidden
             for (i, part) in doc[a..b].split('`').enumerate() {
                 if i > 0 {
                     in_code = !in_code;
-                    job.append("`", 0.0, TextFormat { color: FAINT, ..f.clone() });
                 }
-                let mut pf = f.clone();
-                if in_code && !code_line {
-                    pf.font_id = mono(base.font_id.size * 0.92);
-                    if pf.color == TEXT {
-                        pf.color = CODE;
+                if in_code {
+                    let mut pf = f.clone();
+                    pf.font_id = mono(base.font_id.size * 0.88);
+                    if pf.background == Color32::TRANSPARENT {
+                        pf.background = CODE_BG;
                     }
+                    job.append(part, 0.0, pf);
+                    continue;
                 }
-                job.append(part, 0.0, pf);
+                for (j, piece) in part.split("**").enumerate() {
+                    if j > 0 {
+                        strong = !strong;
+                    }
+                    let mut pf = f.clone();
+                    if strong && pf.color == INK {
+                        pf.color = STRONG;
+                        pf.underline = Stroke::new(0.0, STRONG);
+                    }
+                    job.append(piece, 0.0, pf);
+                }
             }
         }
-        if cuts.len() == 1 {
-            inject(&mut job, r.start);
-        } else {
-            inject(&mut job, r.end);
+        inject(job, r.end);
+    }
+
+    fn block_job(&self, l0: usize, l1: usize, width: f32) -> LayoutJob {
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = width;
+        let mut fence = false;
+        for l in l0..=l1 {
+            let r = anchor::lines_range(&self.s.doc, l, l);
+            self.add_line(&mut job, &r, &mut fence);
+            if l < l1 {
+                job.append("\n", 0.0, TextFormat { font_id: body(16.0), ..Default::default() });
+            }
         }
         if job.text.is_empty() {
-            job.append(" ", 0.0, base);
+            job.append(" ", 0.0, TextFormat::default());
         }
         job
     }
 
-    fn draw_doc(&mut self, ui: &mut egui::Ui) {
-        let lines = self.lines();
-        let target = self.target();
-        let sel = self.sel.map(|s| (s.min(self.cursor), s.max(self.cursor)));
-        let mut clicked = None;
-        let mut fence = false;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add_space(10.0);
-            let width = (ui.available_width() - 96.0).min(860.0);
-            for (i, r) in lines.iter().enumerate() {
-                let job = self.line_job(r, &mut fence, width);
-                let is_cur = i == self.cursor;
-                let in_sel = sel.is_some_and(|(a, b)| (a..=b).contains(&i));
-                let in_block = target.is_some_and(|(a, b)| (a..=b).contains(&i));
-                let fill = if in_sel {
-                    Color32::from_rgb(48, 58, 88)
-                } else if is_cur {
-                    CURSOR_BG
-                } else if in_block {
-                    BLOCK_BG
-                } else {
-                    Color32::TRANSPARENT
-                };
-                let resp = Frame::new()
-                    .fill(fill)
-                    .inner_margin(Margin::symmetric(0, 2))
-                    .show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            let (num, _) = ui.allocate_exact_size(egui::vec2(52.0, 20.0), Sense::hover());
-                            ui.painter().text(
-                                num.right_top() + egui::vec2(-8.0, 3.0),
-                                Align2::RIGHT_TOP,
-                                (i + 1).to_string(),
-                                mono(11.5),
-                                if is_cur { TEXT } else { FAINT },
-                            );
-                            let (bar, _) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), Sense::hover());
-                            if is_cur {
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_size(bar.left_top() + egui::vec2(0.0, -2.0), egui::vec2(3.0, 24.0)),
-                                    0.0,
-                                    ACCENT,
-                                );
-                            }
-                            let ids = self.threads_on(i);
-                            if let Some(t) = self.active.filter(|a| ids.contains(a)).or(ids.first().copied()).and_then(|id| self.thread(id)) {
-                                ui.painter().text(bar.center_top() + egui::vec2(2.0, 2.0), Align2::CENTER_TOP, kind_icon(t.kind), mono(13.0), kind_color(t.kind));
-                            }
-                            ui.add(egui::Label::new(job).selectable(false));
-                            ui.allocate_space(egui::vec2(ui.available_width(), 1.0));
-                        });
-                    })
-                    .response;
-                if is_cur && self.reveal.0 {
-                    resp.scroll_to_me(Some(Align::Center));
-                }
-                if resp.interact(Sense::click()).clicked() {
-                    clicked = Some(i);
-                }
+    /// The text box for the paragraph that the person edits.
+    fn editor(&mut self, ui: &mut egui::Ui, width: f32, acts: &mut Vec<Act>) {
+        let Some(ed) = &mut self.editing else { return };
+        let code = ed.text.trim_start().starts_with("```");
+        let out = Frame::new()
+            .fill(EDIT_BG)
+            .stroke(Stroke::new(1.0, LINK))
+            .corner_radius(6.0)
+            .inner_margin(Margin::symmetric(10, 8))
+            .outer_margin(Margin { left: -11, right: -11, top: -4, bottom: 0 })
+            .show(ui, |ui| {
+                egui::TextEdit::multiline(&mut ed.text)
+                    .font(if code { mono(13.5) } else { body(16.0) })
+                    .frame(Frame::NONE)
+                    .desired_width(width)
+                    .desired_rows(1)
+                    .hint_text("Write here…")
+                    .show(ui)
+            })
+            .inner;
+        let mut out = out;
+        if ed.focus {
+            ed.focus = false;
+            out.response.request_focus();
+            if let Some(p) = ed.place.take() {
+                let c = out.galley.cursor_from_pos(p - out.galley_pos);
+                out.state.cursor.set_char_range(Some(CCursorRange::one(c)));
+            } else {
+                let end = CCursor::new(ed.text.chars().count());
+                out.state.cursor.set_char_range(Some(CCursorRange::one(end)));
             }
-            ui.add_space(40.0);
-            if self.s.doc.trim().is_empty() {
-                ui.label(RichText::new("        The document is empty. Press o to write the first block.").color(DIM));
-            }
+            out.state.clone().store(ui.ctx(), out.response.id);
+        }
+        // Keep the selection when the box loses the focus: the person then
+        // clicks a button that needs it.
+        let cur = out.state.cursor.char_range().map(|c| {
+            let r = c.as_sorted_char_range();
+            let byte = |ci: usize| ed.text.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(ed.text.len());
+            byte(r.start.0)..byte(r.end.0)
         });
-        self.reveal.0 = false;
-        if let Some(i) = clicked {
-            self.move_to(i);
-            self.reveal.0 = false;
+        if cur.as_ref().is_some_and(|c| !c.is_empty()) || out.response.has_focus() {
+            ed.sel = cur;
+        }
+        let has_sel = ed.sel.as_ref().is_some_and(|s| !s.is_empty());
+        let is_new = ed.new_after.is_some();
+        let row = ui
+            .horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new("Done").color(PAPER)).fill(LINK)).clicked() {
+                    acts.push(Act::Commit);
+                }
+                if !is_new {
+                    let label = if has_sel { "Comment on selection" } else { "Comment on paragraph" };
+                    if ui.button(label).clicked() {
+                        acts.push(Act::Comment);
+                    }
+                }
+                ui.label(RichText::new("Changes save when you click outside the box.").color(MUTED).size(12.5));
+            })
+            .response;
+        // A click outside the box and its buttons ends the edit.
+        let over_row = ui.rect_contains_pointer(row.rect.expand(6.0));
+        if out.response.lost_focus() && !over_row && acts.is_empty() {
+            acts.push(Act::Commit);
         }
     }
 
-    fn draw_threads(&mut self, ui: &mut egui::Ui) {
-        let order = self.marks.2.clone();
-        let mut clicked = None;
-        ui.add_space(8.0);
+    fn page(&mut self, ui: &mut egui::Ui) {
+        let mut acts: Vec<Act> = vec![];
+        let blocks = anchor::blocks(&self.s.doc);
+        let reveal_line = self.reveal.0.then(|| self.active).flatten().and_then(|a| self.marks.2.iter().find(|p| p.0 == a).and_then(|p| p.1));
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let page_w = (ui.available_width() - 64.0).clamp(320.0, 820.0);
+            let pad = ((ui.available_width() - page_w) / 2.0).max(16.0);
+            ui.add_space(28.0);
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                Frame::new()
+                    .fill(PAPER)
+                    .stroke(Stroke::new(1.0, RULE))
+                    .corner_radius(8.0)
+                    .inner_margin(Margin { left: 56, right: 56, top: 48, bottom: 56 })
+                    .show(ui, |ui| {
+                      ui.vertical(|ui| {
+                        let width = page_w - 112.0;
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let new_at = self.editing.as_ref().and_then(|e| e.new_after);
+                        if new_at == Some(None) {
+                            self.editor(ui, width, &mut acts);
+                            ui.add_space(14.0);
+                        }
+                        for (l0, l1) in &blocks {
+                            let range = anchor::lines_range(&self.s.doc, *l0, *l1);
+                            let editing_this = self.editing.as_ref().is_some_and(|e| e.new_after.is_none() && e.range == range);
+                            if editing_this {
+                                self.editor(ui, width, &mut acts);
+                            } else {
+                                let resp = ui
+                                    .add(egui::Label::new(self.block_job(*l0, *l1, width)).selectable(false).sense(Sense::click()))
+                                    .on_hover_cursor(CursorIcon::Text);
+                                if resp.clicked() {
+                                    acts.push(Act::Edit(range.clone(), resp.interact_pointer_pos()));
+                                }
+                                if reveal_line.is_some_and(|l| (*l0..=*l1).contains(&l)) {
+                                    resp.scroll_to_me(Some(Align::Center));
+                                }
+                            }
+                            if new_at == Some(Some(*l1)) {
+                                ui.add_space(14.0);
+                                self.editor(ui, width, &mut acts);
+                            }
+                            ui.add_space(14.0);
+                        }
+                        ui.add_space(6.0);
+                        let last = blocks.last().map(|b| b.1);
+                        if self.editing.is_none() {
+                            let hint = if blocks.is_empty() { "Click here to start to write" } else { "+ Add a paragraph" };
+                            let resp = ui
+                                .add(egui::Label::new(RichText::new(hint).color(MUTED).size(15.0)).selectable(false).sense(Sense::click()))
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            if resp.clicked() {
+                                acts.push(Act::New(last));
+                            }
+                        }
+                      });
+                    });
+            });
+            ui.add_space(48.0);
+        });
+        self.reveal.0 = false;
+        // A comment starts before the commit: it needs the selection.
+        acts.sort_by_key(|a| !matches!(a, Act::Comment));
+        if let Some(a) = acts.into_iter().next() {
+            self.act(a);
+        }
+    }
+
+    // ── the comment column ───────────────────────────────────────────────
+
+    fn person(ui: &mut egui::Ui, name: &str, agent: bool) {
+        let c = if agent { AI } else { LINK };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 12.0, c);
+        let initial = name.chars().next().unwrap_or('?').to_uppercase().to_string();
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, initial, body(12.5), PAPER);
+        ui.label(RichText::new(name).color(STRONG).size(14.0));
+        if agent {
+            Frame::new().fill(Color32::from_rgb(238, 230, 255)).corner_radius(4.0).inner_margin(Margin::symmetric(5, 0)).show(ui, |ui| {
+                ui.label(RichText::new("AI").color(AI).size(11.0));
+            });
+        }
+    }
+
+    fn card(&mut self, ui: &mut egui::Ui, t: &Thread, line: Option<usize>) {
+        let on = self.active == Some(t.id);
+        let (label, color) = kind_label(t.kind);
+        let resp = Frame::new()
+            .fill(if on { CARD_ON } else { PAPER })
+            .stroke(Stroke::new(1.0, if on { Color32::from_rgb(232, 200, 110) } else { RULE }))
+            .corner_radius(8.0)
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    Self::person(ui, &t.author, t.agent);
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let when = ago(t.at);
+                        ui.label(RichText::new(if when == "now" { when } else { format!("{when} ago") }).color(MUTED).size(12.0));
+                    });
+                });
+                ui.label(RichText::new(label).color(color).size(12.0));
+                let clip = |s: &str, n: usize| -> String {
+                    let v: Vec<&str> = s.lines().collect();
+                    if on || v.len() <= n { s.to_string() } else { format!("{} …", v[..n].join("\n")) }
+                };
+                match t.kind {
+                    Kind::Comment => {
+                        let q = clip(&t.quote, 2);
+                        let q = if q.chars().count() > 140 && !on { format!("{} …", q.chars().take(140).collect::<String>()) } else { q };
+                        ui.label(RichText::new(format!("“{q}”")).color(MUTED).italics().size(13.0));
+                    }
+                    _ => {
+                        if t.kind != Kind::Insert {
+                            ui.label(RichText::new(clip(&t.quote, 3)).color(DEL).strikethrough().background_color(DEL_BG));
+                        }
+                        if t.kind != Kind::Delete {
+                            ui.label(RichText::new(clip(&t.new, 3)).color(ADD).background_color(ADD_BG));
+                        }
+                    }
+                }
+                if !t.body.is_empty() {
+                    ui.label(RichText::new(clip(&t.body, 5)).color(INK));
+                }
+                if line.is_none() {
+                    ui.label(RichText::new("The text of this thread is no longer in the document.").color(DEL).size(12.5));
+                }
+                for r in &t.replies {
+                    ui.add_space(2.0);
+                    ui.separator();
+                    ui.horizontal(|ui| Self::person(ui, &r.author, r.agent));
+                    ui.label(&r.body);
+                }
+                ui.add_space(4.0);
+
+                // one small form at a time: reply, or reject with a reason
+                let replying = self.reply.as_ref().is_some_and(|r| r.0 == t.id);
+                let rejecting = self.reject.as_ref().is_some_and(|r| r.0 == t.id);
+                if replying {
+                    let text = &mut self.reply.as_mut().unwrap().1;
+                    let r = ui.add(egui::TextEdit::multiline(text).desired_rows(2).desired_width(f32::INFINITY).hint_text("Reply…"));
+                    if !r.has_focus() && text.is_empty() {
+                        r.request_focus();
+                    }
+                    let send = ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Send").color(PAPER)).fill(LINK)).clicked() || send {
+                            let (id, body) = self.reply.take().unwrap();
+                            if !body.trim().is_empty() {
+                                let r = self.s.reply(id, body.trim().to_string());
+                                self.done(r, "Reply sent");
+                            }
+                        } else if ui.button("Cancel").clicked() {
+                            self.reply = None;
+                        }
+                    });
+                } else if rejecting {
+                    let text = &mut self.reject.as_mut().unwrap().1;
+                    let r = ui.add(
+                        egui::TextEdit::multiline(text)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Why? (optional — the AI reads this and learns your preference)"),
+                    );
+                    if !r.has_focus() && text.is_empty() {
+                        r.request_focus();
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Reject suggestion").color(PAPER)).fill(DEL)).clicked() {
+                            let (id, why) = self.reject.take().unwrap();
+                            let why = why.trim().to_string();
+                            let r = self.s.reject(id, (!why.is_empty()).then_some(why));
+                            self.done(r, "Suggestion rejected");
+                        } else if ui.button("Cancel").clicked() {
+                            self.reject = None;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if t.kind.is_proposal() {
+                            if ui.add(egui::Button::new(RichText::new("Accept").color(PAPER)).fill(ADD)).clicked() {
+                                self.commit();
+                                match self.s.accept(t.id, None) {
+                                    Ok(_) => {
+                                        self.refresh();
+                                        self.say("Suggestion accepted. Undo reverses it.");
+                                    }
+                                    Err(e) => self.fail(e),
+                                }
+                            }
+                            if ui.button("Reject").clicked() {
+                                self.reject = Some((t.id, String::new()));
+                                self.reply = None;
+                            }
+                        } else if ui.button("Resolve").clicked() {
+                            let r = self.s.resolve(t.id);
+                            self.done(r, "Comment resolved");
+                        }
+                        if ui.button("Reply").clicked() {
+                            self.reply = Some((t.id, String::new()));
+                            self.reject = None;
+                        }
+                    });
+                }
+            })
+            .response;
+        if on && self.reveal.1 {
+            resp.scroll_to_me(None);
+        }
+        if resp.interact(Sense::click()).clicked() {
+            self.active = Some(t.id);
+            self.reveal.0 = true;
+        }
+    }
+
+    fn column(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(14.0);
+        let open = self.marks.2.len();
         ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            ui.label(RichText::new("THREADS").color(DIM).strong().size(12.0));
-            ui.label(RichText::new(format!("{} open", order.len())).color(DIM).size(12.0));
+            ui.selectable_value(&mut self.tab, Tab::Comments, format!("Comments and suggestions ({open})"));
+            ui.selectable_value(&mut self.tab, Tab::Activity, "Activity");
         });
         ui.add_space(6.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if order.is_empty() {
-                ui.label(RichText::new("  No open threads.\n\n  c  comment on the block\n  v  select lines first\n\n  An agent adds proposals with\n  `redline propose …`").color(DIM));
+            ui.set_width(ui.available_width() - 6.0);
+            if self.tab == Tab::Activity {
+                return self.activity(ui);
             }
-            for (id, line) in &order {
-                let Some(t) = self.thread(*id).cloned() else { continue };
-                let on = self.active == Some(*id);
-                let kc = kind_color(t.kind);
-                let resp = Frame::new()
-                    .fill(if on { CURSOR_BG } else { Color32::TRANSPARENT })
-                    .inner_margin(Margin { left: 14, right: 10, top: 8, bottom: 8 })
-                    .corner_radius(4.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("#{} {} {}", t.id, kind_icon(t.kind), t.kind.name())).color(kc).strong());
-                            ui.label(RichText::new(&t.author).color(if t.agent { AGENT } else { HUMAN }));
-                            ui.label(RichText::new(ago(t.at)).color(DIM));
-                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| match line {
-                                Some(l) => ui.label(RichText::new(format!("L{}", l + 1)).color(DIM)),
-                                None => ui.label(RichText::new("anchor lost").color(DEL)),
-                            });
-                        });
-                        let clip = |s: &str, n: usize| -> String {
-                            let v: Vec<&str> = s.lines().collect();
-                            if on || v.len() <= n { s.to_string() } else { format!("{} …", v[..n].join("\n")) }
-                        };
-                        match t.kind {
-                            Kind::Comment => {
-                                ui.label(RichText::new(format!("“{}”", clip(&t.quote, 2))).color(DIM).italics());
+            if let Some(c) = &mut self.composer {
+                let mut done: Option<bool> = None;
+                Frame::new().fill(PAPER).stroke(Stroke::new(1.5, LINK)).corner_radius(8.0).inner_margin(Margin::same(12)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("New comment").color(STRONG).size(14.0));
+                    let q: String = c.quote.chars().take(160).collect();
+                    ui.label(RichText::new(format!("“{q}{}”", if c.quote.chars().count() > 160 { " …" } else { "" })).color(MUTED).italics().size(13.0));
+                    let r = ui.add(egui::TextEdit::multiline(&mut c.text).desired_rows(3).desired_width(f32::INFINITY).hint_text("Write a comment…"));
+                    if c.focus {
+                        c.focus = false;
+                        r.request_focus();
+                    }
+                    let send = ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Comment").color(PAPER)).fill(LINK)).clicked() || send {
+                            done = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            done = Some(false);
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                if let Some(save) = done {
+                    let c = self.composer.take().unwrap();
+                    if save && !c.text.trim().is_empty() {
+                        match self.s.comment(c.quote, c.line, c.col, c.text.trim().to_string()) {
+                            Ok(id) => {
+                                self.seen_max = self.seen_max.max(id);
+                                self.refresh();
+                                self.active = Some(id);
+                                self.reveal = (true, true);
+                                self.say("Comment added");
                             }
-                            _ => {
-                                if t.kind != Kind::Insert {
-                                    ui.label(RichText::new(clip(&t.quote, 3)).color(DEL).strikethrough());
-                                }
-                                if t.kind != Kind::Delete {
-                                    ui.label(RichText::new(clip(&t.new, 3)).color(ADD));
-                                }
-                            }
+                            Err(e) => self.fail(e),
                         }
-                        if !t.body.is_empty() {
-                            ui.label(clip(&t.body, 4));
-                        }
-                        for r in &t.replies {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                ui.label(RichText::new("↳").color(DIM));
-                                ui.label(RichText::new(format!("{}:", r.author)).color(if r.agent { AGENT } else { HUMAN }));
-                                ui.label(&r.body);
-                            });
-                        }
-                        if on {
-                            let hint = if t.kind.is_proposal() { "a accept · x reject · m modify · r reply" } else { "r reply · R resolve" };
-                            ui.label(RichText::new(hint).color(DIM).size(12.0));
-                        }
-                    })
-                    .response;
-                let bar = egui::Rect::from_min_max(resp.rect.left_top(), egui::pos2(resp.rect.left() + 3.0, resp.rect.bottom()));
-                ui.painter().rect_filled(bar, 1.0, if on { kc } else { FAINT });
-                if on && self.reveal.1 {
-                    resp.scroll_to_me(None);
+                    }
                 }
-                if resp.interact(Sense::click()).clicked() {
-                    clicked = Some((*id, *line));
+            }
+            let order = self.marks.2.clone();
+            if order.is_empty() && self.composer.is_none() {
+                ui.add_space(18.0);
+                ui.label(RichText::new("No open comments or suggestions.").color(STRONG));
+                ui.label(RichText::new("To comment: click in a paragraph, select words if you want, then press “Comment”.\n\nSuggestions from the AI show here and in the text. You decide on each one.").color(MUTED));
+            }
+            for (id, line) in order {
+                if let Some(t) = self.thread(id).cloned() {
+                    self.card(ui, &t, line);
+                    ui.add_space(8.0);
                 }
-                ui.add_space(6.0);
             }
         });
         self.reveal.1 = false;
-        if let Some((id, line)) = clicked {
-            self.active = Some(id);
-            if let Some(l) = line {
-                self.cursor = l;
-                self.reveal.0 = true;
-            }
-        }
     }
 
-    fn draw_history(&self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(12.0);
-            for e in self.s.state.events.iter().rev() {
-                let (head, detail) = e.describe(&self.s.state);
+    fn activity(&self, ui: &mut egui::Ui) {
+        for e in self.s.state.events.iter().rev() {
+            let (head, detail) = e.describe(&self.s.state);
+            Frame::new().fill(PAPER).stroke(Stroke::new(1.0, RULE)).corner_radius(8.0).inner_margin(Margin::same(10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(RichText::new(format!("{:>4} ago", ago(e.at))).color(DIM).font(mono(12.5)));
-                    ui.label(RichText::new(&e.actor).color(if e.agent { AGENT } else { HUMAN }).strong());
-                    ui.label(head);
+                    Self::person(ui, &e.actor, e.agent);
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let when = ago(e.at);
+                        ui.label(RichText::new(if when == "now" { when } else { format!("{when} ago") }).color(MUTED).size(12.0));
+                    });
                 });
-                for d in detail.iter().take(8) {
-                    let c = match d.chars().next() {
-                        Some('-') => DEL,
-                        Some('+') => ADD,
-                        _ => DIM,
+                ui.label(head);
+                for d in detail.iter().take(6) {
+                    let (c, bg) = match d.chars().next() {
+                        Some('-') => (DEL, DEL_BG),
+                        Some('+') => (ADD, ADD_BG),
+                        _ => (MUTED, Color32::TRANSPARENT),
                     };
-                    ui.horizontal(|ui| {
-                        ui.add_space(110.0);
-                        ui.label(RichText::new(d).color(c).font(mono(12.5)));
-                    });
+                    let text = d.get(2..).unwrap_or(d);
+                    if !text.trim().is_empty() {
+                        ui.label(RichText::new(text).color(c).background_color(bg).size(13.0));
+                    }
                 }
-                if detail.len() > 8 {
-                    ui.horizontal(|ui| {
-                        ui.add_space(110.0);
-                        ui.label(RichText::new(format!("… {} more lines", detail.len() - 8)).color(FAINT));
-                    });
+                if detail.len() > 6 {
+                    ui.label(RichText::new(format!("… {} more lines", detail.len() - 6)).color(MUTED).size(12.0));
                 }
-                ui.add_space(6.0);
-            }
-        });
-    }
-
-    fn draw_dialog(&mut self, ui: &egui::Ui) {
-        let Some(d) = &mut self.dialog else { return };
-        if d.fresh {
-            d.fresh = false;
-            ui.request_repaint();
-            return;
-        }
-        let code = matches!(d.purpose, Purpose::Edit(_) | Purpose::NewBlock { .. } | Purpose::Modify(_));
-        let mut done: Option<bool> = None;
-        let resp = egui::Modal::new(egui::Id::unique("redline-dialog")).show(ui.ctx(), |ui| {
-            ui.set_width(if code { 760.0 } else { 560.0 });
-            ui.label(RichText::new(&d.title).color(PALETTE[0]).strong().size(15.0));
-            ui.add_space(6.0);
-            let edit = egui::TextEdit::multiline(&mut d.text)
-                .hint_text(d.hint)
-                .font(if code { mono(14.0) } else { body_font(15.0) })
-                .desired_width(f32::INFINITY)
-                .desired_rows(if code { 12 } else { 4 });
-            let r = egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| ui.add(edit)).inner;
-            r.request_focus();
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    done = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    done = Some(false);
-                }
-                ui.label(RichText::new("ctrl-enter saves · esc cancels").color(DIM).size(12.0));
             });
-            if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter)) {
-                done = Some(true);
-            }
-        });
-        if resp.should_close() && done.is_none() {
-            done = Some(false);
-        }
-        if let Some(save) = done {
-            let d = self.dialog.take().unwrap();
-            if save {
-                self.submit(d);
-            }
-        }
-    }
-
-    fn draw_help(&self, ui: &egui::Ui) {
-        let keys: &[(&str, &str)] = &[
-            ("", "MOVE"),
-            ("j k  ↓ ↑", "line down / up"),
-            ("{ }", "previous / next block"),
-            ("gg  G", "top / bottom"),
-            ("n N", "next / previous thread"),
-            ("tab", "next thread on the same line"),
-            ("", "WRITE"),
-            ("e  enter", "edit the block, or the selected lines"),
-            ("o O", "new block below / above"),
-            ("v", "select lines"),
-            ("dd", "delete the block (d on a selection)"),
-            ("u", "undo"),
-            ("", "REVIEW"),
-            ("a", "accept the proposal"),
-            ("m", "modify the proposal, then accept"),
-            ("x", "reject the proposal, with a reason"),
-            ("c", "comment on the block or selection"),
-            ("r  R", "reply / resolve the comment"),
-            ("", "OTHER"),
-            ("H", "history of events"),
-            ("?", "this help"),
-        ];
-        egui::Modal::new(egui::Id::unique("redline-help")).show(ui.ctx(), |ui| {
-            ui.set_width(420.0);
-            ui.label(RichText::new("redline keys").strong().size(16.0));
-            for (k, d) in keys {
-                if k.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(*d).color(ACCENT).strong().size(12.0));
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([110.0, 18.0], egui::Label::new(RichText::new(*k).font(mono(13.0)).strong()));
-                        ui.label(RichText::new(*d).color(DIM));
-                    });
-                }
-            }
             ui.add_space(6.0);
-            ui.label(RichText::new("any key closes").color(FAINT).size(12.0));
-        });
+        }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // live updates from the agent CLI and other front ends
-        if self.last_poll.elapsed() > Duration::from_millis(300) && self.dialog.is_none() {
+        // Live updates from the agent and from other front ends. Not during
+        // an edit: the text under the edit must not move.
+        if self.last_poll.elapsed() > Duration::from_millis(300) && self.editing.is_none() {
             self.last_poll = Instant::now();
             match self.s.poll() {
                 Ok(true) => {
@@ -949,12 +905,13 @@ impl eframe::App for App {
                         .threads
                         .iter()
                         .filter(|t| t.id > self.seen_max && t.agent)
-                        .map(|t| format!("{} #{} from {}", t.kind.name(), t.id, t.author))
+                        .map(|t| t.author.clone())
                         .collect();
                     self.seen_max = self.s.state.threads.iter().map(|t| t.id).max().unwrap_or(0).max(self.seen_max);
-                    self.sync_active();
-                    if !fresh.is_empty() {
-                        self.say(format!("new: {}  ·  n to go there", fresh.join(", ")));
+                    self.refresh();
+                    if let Some(who) = fresh.first() {
+                        let n = fresh.len();
+                        self.say(format!("{n} new {} from {who}", if n == 1 { "suggestion" } else { "suggestions" }));
                     }
                 }
                 Ok(false) => {}
@@ -962,81 +919,63 @@ impl eframe::App for App {
             }
         }
         ui.request_repaint_after(Duration::from_millis(350));
-        if matches!(&self.flash, Some((_, at, _)) if at.elapsed() > Duration::from_secs(6)) {
+        if matches!(&self.flash, Some((_, at, _)) if at.elapsed() > Duration::from_secs(5)) {
             self.flash = None;
         }
         self.refresh();
-        self.keys(ui);
-        self.refresh();
 
-        let open = self.marks.2.len();
-        let decided = self.s.state.threads.len() - open;
-        let bar = Frame::new().fill(BAR).inner_margin(Margin::symmetric(12, 6));
+        // Ctrl+Z outside a text box reverses the last change to the document.
+        let typing = ui.memory(|m| m.focused().is_some());
+        let undo_key = !typing && ui.input(|i| i.modifiers.command && i.key_pressed(Key::Z));
+        let comment_key = ui.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(Key::M));
+        let mut undo = undo_key;
+
+        let bar = Frame::new().fill(PAPER).inner_margin(Margin::symmetric(16, 10)).stroke(Stroke::new(1.0, RULE));
         egui::Panel::top("top").frame(bar).show_separator_line(false).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("▌redline").color(ACCENT).strong().size(15.0));
-                let name = self.s.store.doc.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                ui.label(RichText::new(name).strong());
-                let dir = self.s.store.doc.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{open} open · {decided} decided")).color(DIM));
-                    ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(dir).color(DIM)).truncate());
-                    });
-                });
-            });
-        });
-        egui::Panel::bottom("status").frame(bar).show_separator_line(false).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (mode, c) = if self.dialog.is_some() {
-                    ("WRITE", PALETTE[0])
-                } else if self.history {
-                    ("HISTORY", AGENT)
-                } else if self.sel.is_some() {
-                    ("SELECT", HUMAN)
-                } else {
-                    ("NORMAL", ACCENT)
-                };
-                Frame::new().fill(c).inner_margin(Margin::symmetric(8, 1)).corner_radius(3.0).show(ui, |ui| {
-                    ui.label(RichText::new(mode).color(Color32::from_rgb(18, 18, 24)).strong().size(12.0));
-                });
-                ui.label(RichText::new(format!("L{}/{}", self.cursor + 1, self.lines().len())).color(DIM));
-                let active = self.active.and_then(|a| self.thread(a));
-                match &self.flash {
+                ui.label(RichText::new("redline").color(BRAND).strong().size(15.0));
+                let name = self.s.store.doc.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                ui.label(RichText::new(name).color(STRONG).size(17.0));
+                ui.add_space(12.0);
+                if ui.button("Undo").on_hover_text("Reverse the last change to the document (Ctrl+Z)").clicked() {
+                    undo = true;
+                }
+                if ui.button("Comment").on_hover_text("Comment on the selected words, or on the paragraph (Ctrl+Alt+M)").clicked() || comment_key {
+                    self.start_comment();
+                }
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| match &self.flash {
                     Some((m, _, err)) => {
-                        ui.label(RichText::new(m).color(if *err { DEL } else { TEXT }));
+                        ui.label(RichText::new(m).color(if *err { DEL } else { ADD }));
                     }
                     None => {
-                        let hint = if self.history {
-                            "H or esc: back"
-                        } else if self.sel.is_some() {
-                            "e edit lines · c comment · d delete · esc cancel"
-                        } else if active.is_some_and(|t| t.kind.is_proposal()) {
-                            "a accept · x reject · m modify · r reply · n next thread"
-                        } else if active.is_some() {
-                            "r reply · R resolve · n next thread"
-                        } else {
-                            "e edit block · o new block · c comment · v select · n next thread · ? help"
+                        let open = self.marks.2.len();
+                        let text = match open {
+                            0 => "Nothing to review".to_string(),
+                            1 => "1 item to review".to_string(),
+                            n => format!("{n} items to review"),
                         };
-                        ui.label(RichText::new(hint).color(DIM));
+                        ui.label(RichText::new(text).color(MUTED));
                     }
-                }
+                });
             });
         });
-        let side = Frame::new().fill(BG).inner_margin(Margin::symmetric(6, 0));
-        egui::Panel::right("threads").frame(side).default_size(400.0).size_range(300.0..=620.0).show(ui, |ui| {
-            self.draw_threads(ui);
-        });
-        egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ui, |ui| {
-            if self.history {
-                self.draw_history(ui);
-            } else {
-                self.draw_doc(ui);
+        if undo {
+            self.commit();
+            match self.s.undo() {
+                Ok(true) => {
+                    self.refresh();
+                    self.say("Change reversed");
+                }
+                Ok(false) => self.say("There is nothing to undo"),
+                Err(e) => self.fail(e),
             }
-        });
-        if self.help {
-            self.draw_help(ui);
         }
-        self.draw_dialog(ui);
+        let side = Frame::new().fill(DESK).inner_margin(Margin { left: 4, right: 12, top: 0, bottom: 0 });
+        egui::Panel::right("threads").frame(side).show_separator_line(false).default_size(390.0).size_range(300.0..=560.0).show(ui, |ui| {
+            self.column(ui);
+        });
+        egui::CentralPanel::default().frame(Frame::new().fill(DESK)).show(ui, |ui| {
+            self.page(ui);
+        });
     }
 }

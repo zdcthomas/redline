@@ -116,11 +116,25 @@ popup_height = 84
 nix run github:zdcthomas/redline#redline-app -- spec.md
 ```
 
-A window with the same layout and the same keys as the TUI: the document on
-the left with the suggestions inline, the threads on the right. `e` opens the
-block in a text box in the window, so the app needs no terminal and no
-external editor. The mouse also works: click a line or a thread. The app is in
-[app/](app/), written with egui, and it shows new agent proposals live.
+The app is for people who do not use a terminal. It looks and works like a
+document editor, with no modes and no key commands to learn:
+
+- **Read.** The spec shows as a page. Headings, lists and code show as
+  formatted text, not as Markdown marks.
+- **Write.** Click a paragraph: it becomes a text box in place. Click outside
+  the box, or press Done, to save. "Add a paragraph" is at the end of the page.
+- **Comment.** Click in a paragraph, select words if you want (a double-click
+  selects one word), then press Comment. The comment goes on the selected
+  words, or on the paragraph.
+- **Review.** Each suggestion and comment is a card in the right column, with
+  Accept, Reject, Reply and Resolve buttons. Reject asks for an optional
+  reason, which the agent reads. A suggestion also shows in the text: removed
+  text is red and struck through, added text is green.
+- **Activity.** The second tab of the column shows the history.
+- **Undo.** The Undo button, or Ctrl+Z outside a text box.
+
+The app is in [app/](app/), written with egui. It shows new suggestions from
+the agent live.
 
 ## Agents
 
