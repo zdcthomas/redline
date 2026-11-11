@@ -88,9 +88,10 @@ impl App {
         let numw = self.n_lines.to_string().len().max(2);
         let gutter = numw + 5;
         let width = (area.width as usize).saturating_sub(gutter + 1).max(8);
-        let key = (self.version, width, self.active);
+        let (csel, word) = (self.char_range(), self.word_range());
+        let key = (self.version, width, self.active, csel.clone(), word.clone());
         if key != self.view_key {
-            self.view = view::build(&self.doc, &self.state.threads, &self.ix, self.active, width);
+            self.view = view::build(&self.doc, &self.state.threads, &self.ix, self.active, width, csel.as_ref(), word.as_ref());
             self.view_key = key;
         }
         let h = area.height as usize;
@@ -303,8 +304,10 @@ impl App {
             pill("THREADS", NOTE)
         } else if self.mode == Mode::Thread {
             pill("THREAD", NOTE)
-        } else if self.sel.is_some() {
+        } else if self.sel.is_some() || self.csel.is_some() {
             pill("SELECT", HUMAN)
+        } else if self.col.is_some() {
+            pill("TEXT", H2)
         } else {
             pill("NORMAL", ACCENT)
         };
@@ -321,8 +324,12 @@ impl App {
                     "j k move · enter open the thread · a x m r R act · q back"
                 } else if self.mode == Mode::Thread {
                     "j k scroll · a x m r R act · n N other thread · q back to the list"
+                } else if self.csel.is_some() {
+                    "w b h l extend · c comment on the selected text · e edit · d delete · esc cancel"
                 } else if self.sel.is_some() {
                     "e edit lines · c comment · d delete · esc cancel"
+                } else if self.col.is_some() {
+                    "w b move by word · h l by character · v start a selection · esc back to lines"
                 } else if active.is_some_and(|t| t.kind.is_proposal()) {
                     "a accept · x reject · m modify · r reply · n next thread"
                 } else if active.is_some() {
@@ -384,6 +391,8 @@ impl App {
             ("o O", "new block below / above"),
             ("E", "edit the whole document"),
             ("v", "select lines"),
+            ("w b  h l", "text cursor: move by word / character"),
+            ("w … v … c", "select an exact text range, then comment on it"),
             ("dd", "delete the block (d on a selection)"),
             ("u", "undo"),
             ("", "REVIEW"),

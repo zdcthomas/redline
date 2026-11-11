@@ -88,6 +88,8 @@ redline spec.md
 | `o` `O` | new block below / above |
 | `E` | edit the whole document |
 | `v` | select lines |
+| `w` `b` `h` `l` | text cursor: move by word / by character; `esc` goes back to lines |
+| `w` … `v` … `c` | select an exact text range, then comment on it. `v` then `w` selects one word. `e` and `d` also act on the range |
 | `dd` | delete the block (`d` on a selection) |
 | `u` | undo (an undo of an accept opens the proposal again) |
 | `a` `m` `x` | accept / modify then accept / reject with a reason |

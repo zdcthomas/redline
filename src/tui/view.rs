@@ -68,7 +68,17 @@ struct Claim {
 
 type Cells = Vec<(char, Style)>;
 
-pub fn build(doc: &str, threads: &[Thread], ix: &Index, active: Option<u64>, width: usize) -> View {
+/// `sel` is the selected text and `cur` is the word below the word cursor,
+/// both as byte ranges of the document.
+pub fn build(
+    doc: &str,
+    threads: &[Thread],
+    ix: &Index,
+    active: Option<u64>,
+    width: usize,
+    sel: Option<&Range<usize>>,
+    cur: Option<&Range<usize>>,
+) -> View {
     let ls = anchor::line_starts(doc);
     let mut claims: Vec<Claim> = vec![];
     let mut injects: HashMap<usize, Vec<(u64, String)>> = HashMap::new();
@@ -134,6 +144,12 @@ pub fn build(doc: &str, threads: &[Thread], ix: &Index, active: Option<u64>, wid
                         if on { s.bg(DEL_BG) } else { s }
                     }
                 };
+            }
+            if sel.is_some_and(|r| r.contains(&b)) {
+                st = st.bg(SELECT_BG);
+            }
+            if cur.is_some_and(|r| r.contains(&b)) {
+                st = st.bg(H2).fg(ratatui::style::Color::Rgb(18, 18, 24));
             }
             let row = logical.last_mut().unwrap();
             if ch == '\t' {

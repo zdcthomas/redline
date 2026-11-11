@@ -30,7 +30,7 @@ enum Mode {
 }
 
 enum InputPurpose {
-    Comment { quote: String, line: usize },
+    Comment { quote: String, line: usize, col: usize },
     Reply(u64),
     Reject(u64),
 }
@@ -80,12 +80,16 @@ pub struct App {
     ix: view::Index,
     cursor: usize,
     sel: Option<usize>,
+    /// The word cursor: a byte offset in the cursor line. `None` = line mode.
+    col: Option<usize>,
+    /// Start of a word selection: (line, byte offset).
+    csel: Option<(usize, usize)>,
     scroll: usize,
     active: Option<u64>,
     side_scroll: usize,
     show_side: bool,
     view: view::View,
-    view_key: (u64, usize, Option<u64>),
+    view_key: (u64, usize, Option<u64>, Option<Range<usize>>, Option<Range<usize>>),
     mode: Mode,
     pending: Option<char>,
     flash: Option<(String, Instant, bool)>,
@@ -99,6 +103,25 @@ pub struct App {
     max_id: u64,
     page: usize,
     quit: bool,
+}
+
+/// The words of a line: runs of characters that are not whitespace.
+fn words(text: &str) -> Vec<Range<usize>> {
+    let mut out = vec![];
+    let mut start = None;
+    for (i, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                out.push(s..i);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        out.push(s..text.len());
+    }
+    out
 }
 
 fn shquote(p: &Path) -> String {
@@ -122,12 +145,14 @@ pub fn run(path: &Path) -> Result<()> {
         ix: Default::default(),
         cursor: 0,
         sel: None,
+        col: None,
+        csel: None,
         scroll: 0,
         active: None,
         side_scroll: 0,
         show_side: true,
         view: Default::default(),
-        view_key: (u64::MAX, 0, None),
+        view_key: (u64::MAX, 0, None, None, None),
         mode: Mode::Normal,
         pending: None,
         flash: None,
@@ -210,6 +235,8 @@ impl App {
         if let Some(s) = self.sel {
             self.sel = Some(s.min(self.n_lines - 1));
         }
+        self.csel = None;
+        self.snap_col();
         if self.active.is_some_and(|a| !self.ix.order.contains(&a)) {
             self.active = None;
         }
@@ -273,7 +300,99 @@ impl App {
 
     fn move_to(&mut self, line: usize) {
         self.cursor = line.min(self.n_lines - 1);
+        self.snap_col();
         self.sync_active();
+    }
+
+    // ── word cursor ──────────────────────────────────────────────────────
+
+    fn line_str(&self, line: usize) -> &str {
+        &self.doc[anchor::lines_range(&self.doc, line, line)]
+    }
+
+    /// Keep the text cursor on a character of the cursor line.
+    fn snap_col(&mut self) {
+        if let Some(c) = self.col {
+            let text = self.line_str(self.cursor);
+            let mut c = c.min(text.len());
+            while !text.is_char_boundary(c) {
+                c -= 1;
+            }
+            if c == text.len() {
+                c = text.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+            }
+            self.col = Some(c);
+        }
+    }
+
+    /// The character at (line, col), as a byte range of the document.
+    fn char_at(&self, line: usize, col: usize) -> Range<usize> {
+        let start = anchor::lines_range(&self.doc, line, line).start;
+        let text = self.line_str(line);
+        let col = col.min(text.len());
+        let len = text[col..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        start + col..start + col + len
+    }
+
+    /// The character below the text cursor, as a byte range of the document.
+    pub(super) fn word_range(&self) -> Option<Range<usize>> {
+        Some(self.char_at(self.cursor, self.col?))
+    }
+
+    /// The selected text: an exact range from the start of the selection to
+    /// the text cursor, both included.
+    pub(super) fn char_range(&self) -> Option<Range<usize>> {
+        let (al, ac) = self.csel?;
+        let cur = self.word_range()?;
+        let a = self.char_at(al.min(self.n_lines - 1), ac);
+        Some(a.start.min(cur.start)..a.end.max(cur.end))
+    }
+
+    /// Move the text cursor by a word. With a selection, a forward step goes
+    /// to the end of a word, so `v` then `w` selects exactly one word.
+    fn word_step(&mut self, fwd: bool) {
+        let to_end = fwd && self.csel.is_some();
+        let stop = |text: &str, w: &Range<usize>| -> usize {
+            if to_end { text[..w.end].char_indices().next_back().map(|(i, _)| i).unwrap_or(w.start) } else { w.start }
+        };
+        let text = self.line_str(self.cursor);
+        let ws = words(text);
+        let Some(c) = self.col else {
+            self.col = Some(ws.first().map(|w| w.start).unwrap_or(0));
+            return;
+        };
+        let here = if fwd { ws.iter().find(|w| stop(text, w) > c) } else { ws.iter().rev().find(|w| w.start < c) };
+        if let Some(w) = here {
+            self.col = Some(stop(text, w));
+            return;
+        }
+        // go to the next / previous line that has words
+        let mut l = self.cursor;
+        loop {
+            l = if fwd { l + 1 } else { l.wrapping_sub(1) };
+            if l >= self.n_lines {
+                return;
+            }
+            let text = self.line_str(l);
+            let ws = words(text);
+            if let Some(w) = if fwd { ws.first() } else { ws.last() } {
+                let col = stop(text, w);
+                self.cursor = l;
+                self.col = Some(col);
+                self.sync_active();
+                return;
+            }
+        }
+    }
+
+    fn char_step(&mut self, fwd: bool) {
+        let text = self.line_str(self.cursor);
+        let c = self.col.unwrap_or(0).min(text.len());
+        self.col = Some(if fwd {
+            text[c..].chars().next().map(|ch| c + ch.len_utf8()).filter(|n| *n < text.len()).unwrap_or(c)
+        } else {
+            text[..c].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+        });
     }
 
     fn step_thread(&mut self, fwd: bool) {
@@ -384,17 +503,18 @@ impl App {
     fn submit_input(&mut self, inp: Input) {
         let body = inp.text.trim().to_string();
         match inp.purpose {
-            InputPurpose::Comment { quote, line } => {
+            InputPurpose::Comment { quote, line, col } => {
                 if body.is_empty() {
                     return self.say("empty comment: not added");
                 }
                 let id = self.tx(|tx, me| {
-                    let eid = tx.log(me, What::Commented { line, col: 0, quote, body });
+                    let eid = tx.log(me, What::Commented { line, col, quote, body });
                     Ok(num(&tx.state, &eid))
                 });
                 if let Some(id) = id {
                     self.max_id = self.max_id.max(id);
                     self.sel = None;
+                    self.csel = None;
                     self.active = Some(id);
                     self.say(format!("comment #{id} added"));
                 }
@@ -645,8 +765,35 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let pending = self.pending.take();
         let last = self.n_lines - 1;
+        // With a word selection, c / e / d act on exactly the selected words.
+        if let (Some(range), KeyCode::Char(ch @ ('c' | 'e' | 'd')), false) = (self.char_range(), k.code, ctrl) {
+            let text = self.doc[range.clone()].to_string();
+            match ch {
+                'c' => {
+                    let (line, col) = anchor::pos(&self.doc, range.start);
+                    let short: String = text.chars().take(28).collect();
+                    let more = if text.chars().count() > 28 { "…" } else { "" };
+                    self.open_input(format!("Comment on “{short}{more}”"), "", InputPurpose::Comment { quote: text, line, col });
+                }
+                'e' => self.start_edit(terminal, Purpose::Replace(range), text, "selected words".into())?,
+                _ => {
+                    if self.edit(range, "", "delete") {
+                        self.say("deleted the selected words  ·  u to undo");
+                    }
+                }
+            }
+            return Ok(());
+        }
         match k.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('w') => self.word_step(true),
+            KeyCode::Char('b') => self.word_step(false),
+            KeyCode::Char('l') | KeyCode::Right => self.char_step(true),
+            KeyCode::Char('h') | KeyCode::Left => self.char_step(false),
+            KeyCode::Char('v') if self.col.is_some() => {
+                self.sel = None;
+                self.csel = if self.csel.is_some() { None } else { Some((self.cursor, self.col.unwrap_or(0))) };
+            }
             KeyCode::Char('d') if ctrl => self.move_to(self.cursor + (self.page / 2).max(1)),
             KeyCode::Char('u') if ctrl => self.move_to(self.cursor.saturating_sub((self.page / 2).max(1))),
             KeyCode::PageDown => self.move_to(self.cursor + self.page.max(1)),
@@ -673,9 +820,17 @@ impl App {
                     self.active = Some(h[i % h.len()]);
                 }
             }
-            KeyCode::Char('v' | 'V') => self.sel = if self.sel.is_some() { None } else { Some(self.cursor) },
+            KeyCode::Char('v' | 'V') => {
+                self.csel = None;
+                self.sel = if self.sel.is_some() { None } else { Some(self.cursor) };
+            }
             KeyCode::Esc => {
+                // first the selection, then the word cursor
+                if self.sel.is_none() && self.csel.is_none() {
+                    self.col = None;
+                }
                 self.sel = None;
+                self.csel = None;
                 self.flash = None;
             }
             KeyCode::Char('d') if self.sel.is_some() || pending == Some('d') => self.delete_target(),
@@ -711,7 +866,7 @@ impl App {
                         self.say("no text to comment on");
                     } else {
                         let title = if l0 == l1 { format!("Comment on L{}", l0 + 1) } else { format!("Comment on L{}–{}", l0 + 1, l1 + 1) };
-                        self.open_input(title, "", InputPurpose::Comment { quote, line: l0 });
+                        self.open_input(title, "", InputPurpose::Comment { quote, line: l0, col: 0 });
                     }
                 }
                 None => self.say("no text to comment on"),
