@@ -1,19 +1,22 @@
 //! redline as a native window, for people who do not live in a terminal.
 //!
 //! It looks and works like a document editor: a page, a comment column, and
-//! buttons. Click a paragraph to edit it, select words to comment on them,
-//! and press Accept or Reject on a suggestion. There are no modes and no
-//! key commands to learn. It shows the same state as the TUI and the Neovim
+//! buttons. The page is one text surface: click and type. The app saves the
+//! text when the person stops. In the suggestion mode a change becomes a
+//! suggestion. Select words to comment on them, and press Accept or Reject
+//! on a suggestion. It shows the same state as the TUI and the Neovim
 //! plugin: the fold of the event log.
 
 use eframe::egui::{
     self, Align, Color32, CursorIcon, FontFamily, FontId, Frame, Key, Margin, RichText, Sense, Stroke, TextFormat,
     text::{CCursor, CCursorRange, LayoutJob},
+    text_edit::TextEditState,
 };
 use redline::anchor;
 use redline::ops::Session;
-use redline::store::{Kind, Thread, ago};
+use redline::store::{Kind, Status, Thread, ago};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // A light document look.
@@ -31,8 +34,8 @@ const ADD_BG_ON: Color32 = Color32::from_rgb(178, 235, 195);
 const DEL: Color32 = Color32::from_rgb(190, 38, 46);
 const DEL_BG: Color32 = Color32::from_rgb(255, 232, 230);
 const DEL_BG_ON: Color32 = Color32::from_rgb(255, 205, 201);
+const PALE: Color32 = Color32::from_rgb(176, 183, 194);
 const CODE_BG: Color32 = Color32::from_rgb(240, 242, 245);
-const EDIT_BG: Color32 = Color32::from_rgb(248, 250, 255);
 const CARD_ON: Color32 = Color32::from_rgb(255, 250, 235);
 const AI: Color32 = Color32::from_rgb(120, 76, 196);
 /// Highlight colors for comments: (normal, selected). Comments that share
@@ -52,6 +55,226 @@ fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
+/// The look of one character of the page.
+#[derive(Clone, Copy, PartialEq)]
+struct St {
+    mono: bool,
+    size: f32,
+    color: Color32,
+    bg: Color32,
+    italics: bool,
+    strike: bool,
+    under: Option<Color32>,
+    height: f32,
+}
+
+impl St {
+    fn format(&self) -> TextFormat {
+        TextFormat {
+            font_id: if self.mono { mono(self.size) } else { body(self.size) },
+            color: self.color,
+            background: self.bg,
+            italics: self.italics,
+            strikethrough: if self.strike { Stroke::new(1.0, self.color) } else { Stroke::NONE },
+            underline: self.under.map(|c| Stroke::new(1.0, c)).unwrap_or(Stroke::NONE),
+            line_height: (self.height > 0.0).then_some(self.height),
+            ..Default::default()
+        }
+    }
+}
+
+/// What a range of the page shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Paint {
+    /// The text that a thread is about.
+    Thread(Kind),
+    /// The new text of a suggestion. It is on the page but not in the document.
+    New,
+}
+
+/// One colored range of the page: (bytes, paint, tint, selected).
+type Shown = (Range<usize>, Paint, usize, bool);
+
+/// The text of the document as formatted text. Each character stays, so
+/// the person can type in it: a Markdown mark shows pale, a heading is
+/// large, and a thread colors its text.
+fn style_doc(text: &str, shown: &[Shown]) -> LayoutJob {
+    let mut out: Vec<(usize, St)> = Vec::with_capacity(text.len());
+    let mut fence = false;
+    let mut at = 0;
+    for full in text.split_inclusive('\n') {
+        let l = full.strip_suffix('\n').unwrap_or(full);
+        let t = l.trim_start();
+        let indent = l.len() - t.len();
+        let is_fence = t.starts_with("```") || t.starts_with("~~~");
+        let code_line = fence || is_fence;
+        if is_fence {
+            fence = !fence;
+        }
+        let plain = St { mono: false, size: 16.0, color: INK, bg: Color32::TRANSPARENT, italics: false, strike: false, under: None, height: 25.0 };
+        let hashes = t.chars().take_while(|c| *c == '#').count();
+        // `lead` bytes at the start of the line are a Markdown mark.
+        let (base, lead, lead_color) = if code_line {
+            (St { mono: true, size: 13.5, color: if is_fence { PALE } else { INK }, bg: CODE_BG, height: 21.0, ..plain }, 0, PALE)
+        } else if t.starts_with('|') {
+            let rule = t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
+            (St { mono: true, size: 13.5, color: if rule { RULE } else { INK }, height: 22.0, ..plain }, 0, PALE)
+        } else if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
+            let size = match hashes {
+                1 => 30.0,
+                2 => 22.0,
+                _ => 18.0,
+            };
+            (St { size, color: STRONG, height: size * 1.5, ..plain }, indent + hashes + 1, PALE)
+        } else if t.starts_with('>') {
+            (St { color: MUTED, italics: true, ..plain }, indent + 1, PALE)
+        } else {
+            let tb = t.as_bytes();
+            let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+            if tb.len() >= 2 && matches!(tb[0], b'-' | b'*' | b'+') && tb[1] == b' ' {
+                (plain, indent + 2, BRAND)
+            } else if digits > 0 && t[digits..].starts_with(". ") {
+                (plain, indent + digits + 2, BRAND)
+            } else {
+                (plain, 0, PALE)
+            }
+        };
+        let cs: Vec<(usize, char)> = l.char_indices().collect();
+        let mut st = vec![base; cs.len()];
+        let pale = St { color: PALE, ..base };
+        let (mut code, mut strong, mut em) = (false, false, false);
+        let mut i = 0;
+        while i < cs.len() {
+            let (off, c) = cs[i];
+            let next = cs.get(i + 1).map(|x| x.1);
+            if off < lead {
+                st[i] = St { color: lead_color, ..base };
+            } else if code_line {
+            } else if c == '`' {
+                code = !code;
+                st[i] = pale;
+            } else if code {
+                st[i] = St { mono: true, size: base.size * 0.88, bg: CODE_BG, ..base };
+            } else if c == '*' && next == Some('*') {
+                strong = !strong;
+                st[i] = pale;
+                st[i + 1] = pale;
+                i += 1;
+            } else if c == '*' && {
+                // A `*` is a mark only when it touches a word: "2 * 3" stays as text.
+                let before = i > 0 && !cs[i - 1].1.is_whitespace();
+                let after = next.is_some_and(|n| !n.is_whitespace()) && cs[i + 1..].iter().any(|x| x.1 == '*');
+                if em { before } else { after }
+            } {
+                em = !em;
+                st[i] = pale;
+            } else {
+                // [text](address)
+                let link = (c == '[')
+                    .then(|| {
+                        let close = cs[i + 1..].iter().position(|x| x.1 == ']' || x.1 == '[').map(|p| i + 1 + p)?;
+                        (cs[close].1 == ']' && close > i + 1 && cs.get(close + 1).map(|x| x.1) == Some('(')).then_some(())?;
+                        let end = cs[close + 2..].iter().position(|x| x.1 == ')').map(|p| close + 2 + p)?;
+                        Some((close, end))
+                    })
+                    .flatten();
+                let mut cur = base;
+                if strong {
+                    cur.color = STRONG;
+                    cur.under = Some(Color32::from_rgb(200, 205, 212));
+                }
+                cur.italics |= em;
+                if let Some((close, end)) = link {
+                    st[i] = pale;
+                    for s in &mut st[i + 1..close] {
+                        *s = St { color: LINK, under: Some(LINK), ..cur };
+                    }
+                    for s in &mut st[close..=end] {
+                        *s = St { size: base.size * 0.8, ..pale };
+                    }
+                    i = end;
+                } else {
+                    st[i] = cur;
+                }
+            }
+            i += 1;
+        }
+        out.extend(cs.iter().zip(&st).map(|((off, _), s)| (at + off, *s)));
+        if full.len() > l.len() {
+            out.push((at + l.len(), St { bg: Color32::TRANSPARENT, under: None, strike: false, ..base }));
+        }
+        at += full.len();
+    }
+    // the threads: a suggestion wins over a comment on the same text
+    for pass in [true, false] {
+        for (r, kind, tint, on) in shown {
+            if (*kind == Paint::Thread(Kind::Comment)) != pass || r.is_empty() {
+                continue;
+            }
+            let a = out.partition_point(|x| x.0 < r.start);
+            let b = out.partition_point(|x| x.0 < r.end);
+            for (off, s) in &mut out[a..b] {
+                if text.as_bytes()[*off] == b'\n' {
+                    continue;
+                }
+                match kind {
+                    Paint::Thread(Kind::Comment) => s.bg = if *on { TINTS[*tint].1 } else { TINTS[*tint].0 },
+                    Paint::Thread(Kind::Insert) => s.under = Some(ADD),
+                    Paint::New => {
+                        s.color = ADD;
+                        s.under = None;
+                        s.bg = if *on { ADD_BG_ON } else { ADD_BG };
+                    }
+                    Paint::Thread(_) => {
+                        s.color = DEL;
+                        s.strike = true;
+                        s.under = None;
+                        s.bg = if *on { DEL_BG_ON } else { DEL_BG };
+                    }
+                }
+            }
+        }
+    }
+    let mut job = LayoutJob::default();
+    let mut i = 0;
+    while i < out.len() {
+        let mut j = i + 1;
+        while j < out.len() && out[j].1 == out[i].1 {
+            j += 1;
+        }
+        let end = out.get(j).map(|x| x.0).unwrap_or(text.len());
+        job.append(&text[out[i].0..end], 0.0, out[i].1.format());
+        i = j;
+    }
+    job
+}
+
+/// The one change between two texts: (bytes of `old`, bytes of `new`).
+fn diff(old: &str, new: &str) -> Option<(Range<usize>, Range<usize>)> {
+    if old == new {
+        return None;
+    }
+    let (ob, nb) = (old.as_bytes(), new.as_bytes());
+    let mut p = ob.iter().zip(nb).take_while(|(a, b)| a == b).count();
+    while !old.is_char_boundary(p) {
+        p -= 1;
+    }
+    let max = ob.len().min(nb.len()) - p;
+    let mut s = ob.iter().rev().zip(nb.iter().rev()).take(max).take_while(|(a, b)| a == b).count();
+    while !old.is_char_boundary(ob.len() - s) {
+        s -= 1;
+    }
+    Some((p..ob.len() - s, p..nb.len() - s))
+}
+
+fn byte_of(s: &str, chars: usize) -> usize {
+    s.char_indices().nth(chars).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+fn char_of(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())].chars().count()
+}
+
 fn kind_label(k: Kind) -> (&'static str, Color32) {
     match k {
         Kind::Comment => ("Comment", Color32::from_rgb(150, 110, 0)),
@@ -66,24 +289,7 @@ struct Mark {
     id: u64,
     kind: Kind,
     range: Range<usize>,
-    /// Proposed text, shown at this offset.
-    inject: Option<(usize, String)>,
     tint: usize,
-}
-
-/// The paragraph that the person edits now.
-struct Editing {
-    /// The text that this edit replaces. Empty for a new paragraph.
-    range: Range<usize>,
-    /// For a new paragraph: the line that it goes after (`None` = top).
-    new_after: Option<Option<usize>>,
-    text: String,
-    initial: String,
-    /// Put the text cursor at this screen position (from the click).
-    place: Option<egui::Pos2>,
-    focus: bool,
-    /// Selected bytes of `text`.
-    sel: Option<Range<usize>>,
 }
 
 struct Composer {
@@ -97,14 +303,8 @@ struct Composer {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Comments,
+    Closed,
     Activity,
-}
-
-enum Act {
-    Edit(Range<usize>, Option<egui::Pos2>),
-    New(Option<usize>),
-    Commit,
-    Comment,
 }
 
 struct App {
@@ -112,10 +312,29 @@ struct App {
     /// (session version, marks, (thread, first line) in document order).
     marks: (u64, Vec<Mark>, Vec<(u64, Option<usize>)>),
     active: Option<u64>,
-    editing: Option<Editing>,
+    /// The text on the page: the document plus the new text of each
+    /// suggestion. The person types in it.
+    view: String,
+    /// `view` before the person typed.
+    view0: String,
+    /// The new text of each suggestion in `view0`: (bytes, thread).
+    segs: Vec<(Range<usize>, u64)>,
+    /// The document with the change that the person typed. It differs from
+    /// the saved text for a moment.
+    buf: String,
+    /// Time of the last key.
+    typed: Instant,
+    /// The selected bytes of `buf`, or the place of the text cursor.
+    sel: Range<usize>,
+    /// Suggestion mode: a change becomes a suggestion.
+    suggest: bool,
+    /// Put the keyboard focus in the page.
+    focus: bool,
     composer: Option<Composer>,
     reply: Option<(u64, String)>,
     reject: Option<(u64, String)>,
+    /// Accept with changes: (thread, the changed text).
+    modify: Option<(u64, String)>,
     tab: Tab,
     flash: Option<(String, Instant, bool)>,
     /// Scroll the page / the comment column to the selected thread once.
@@ -124,80 +343,233 @@ struct App {
     seen_max: u64,
 }
 
-fn main() -> eframe::Result {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: redline-app FILE");
-        std::process::exit(2);
-    };
-    let path = std::path::PathBuf::from(path);
+fn style(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Light);
+    let mut v = egui::Visuals::light();
+    v.panel_fill = DESK;
+    v.window_fill = PAPER;
+    v.override_text_color = Some(INK);
+    v.extreme_bg_color = PAPER;
+    v.selection.bg_fill = Color32::from_rgb(188, 214, 255);
+    v.selection.stroke = Stroke::new(1.0, LINK);
+    v.widgets.inactive.corner_radius = 6.0.into();
+    v.widgets.hovered.corner_radius = 6.0.into();
+    v.widgets.active.corner_radius = 6.0.into();
+    ctx.set_visuals(v);
+    ctx.all_styles_mut(|st| {
+        st.spacing.button_padding = egui::vec2(10.0, 5.0);
+        st.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        for (style, font) in st.text_styles.iter_mut() {
+            font.size = match style {
+                egui::TextStyle::Heading => 22.0,
+                egui::TextStyle::Small => 12.0,
+                egui::TextStyle::Monospace => 13.5,
+                _ => 14.5,
+            };
+        }
+    });
+}
+
+/// Open a document. Makes the file if it does not exist.
+fn open_doc(path: &Path) -> anyhow::Result<Session> {
     if !path.exists() {
-        std::fs::write(&path, "").ok();
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, "")?;
     }
-    let s = match Session::open(&path) {
+    Session::open(path)
+}
+
+fn title(path: &Path) -> String {
+    let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    format!("{name} — redline")
+}
+
+/// The documents that redline knows and that still exist, newest first.
+fn tracked_docs() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> =
+        redline::store::tracked().into_iter().map(|(p, _)| PathBuf::from(p)).filter(|p| p.is_file()).collect();
+    v.sort_by_key(|p| std::cmp::Reverse(p.metadata().and_then(|m| m.modified()).ok()));
+    v
+}
+
+/// The file for a new document with this name: in the Documents folder.
+fn new_path(name: &str) -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let dir = Some(home.join("Documents")).filter(|d| d.is_dir()).unwrap_or(home);
+    let name: String = name.trim().chars().map(|c| if c == '/' || c == '\\' { '-' } else { c }).collect();
+    dir.join(if name.ends_with(".md") { name } else { format!("{name}.md") })
+}
+
+fn main() -> eframe::Result {
+    let first = std::env::args().nth(1).map(|p| match open_doc(Path::new(&p)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("redline-app: {e:#}");
             std::process::exit(1);
         }
-    };
-    let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    });
+    let name = first.as_ref().map(|s| title(&s.store.doc)).unwrap_or_else(|| "redline".into());
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("{name} — redline"))
-            .with_app_id("redline")
-            .with_inner_size([1280.0, 880.0]),
+        viewport: egui::ViewportBuilder::default().with_title(name).with_app_id("redline").with_inner_size([1280.0, 880.0]),
         ..Default::default()
     };
     eframe::run_native(
         "redline",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Light);
-            let mut v = egui::Visuals::light();
-            v.panel_fill = DESK;
-            v.window_fill = PAPER;
-            v.override_text_color = Some(INK);
-            v.extreme_bg_color = PAPER;
-            v.selection.bg_fill = Color32::from_rgb(188, 214, 255);
-            v.selection.stroke = Stroke::new(1.0, LINK);
-            v.widgets.inactive.corner_radius = 6.0.into();
-            v.widgets.hovered.corner_radius = 6.0.into();
-            v.widgets.active.corner_radius = 6.0.into();
-            cc.egui_ctx.set_visuals(v);
-            cc.egui_ctx.all_styles_mut(|st| {
-                st.spacing.button_padding = egui::vec2(10.0, 5.0);
-                st.spacing.item_spacing = egui::vec2(8.0, 6.0);
-                for (style, font) in st.text_styles.iter_mut() {
-                    font.size = match style {
-                        egui::TextStyle::Heading => 22.0,
-                        egui::TextStyle::Small => 12.0,
-                        egui::TextStyle::Monospace => 13.5,
-                        _ => 14.5,
-                    };
-                }
-            });
-            let seen_max = s.state.threads.iter().map(|t| t.id).max().unwrap_or(0);
-            let mut app = App {
-                s,
-                marks: (0, vec![], vec![]),
-                active: None,
-                editing: None,
-                composer: None,
-                reply: None,
-                reject: None,
-                tab: Tab::Comments,
-                flash: None,
-                reveal: (false, false),
-                last_poll: Instant::now(),
-                seen_max,
-            };
-            app.refresh();
-            Ok(Box::new(app))
+            style(&cc.egui_ctx);
+            Ok(Box::new(Root { app: first.map(App::new), docs: tracked_docs(), name: String::new(), error: None }))
         }),
     )
 }
 
+enum Go {
+    Open(PathBuf),
+    Home,
+}
+
+/// The window: the start page, or one document.
+struct Root {
+    app: Option<App>,
+    docs: Vec<PathBuf>,
+    /// Name of a new document.
+    name: String,
+    error: Option<String>,
+}
+
+impl Root {
+    fn start(&mut self, ui: &mut egui::Ui, go: &mut Option<Go>) {
+        egui::CentralPanel::default().frame(Frame::new().fill(DESK)).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let w = (ui.available_width() - 32.0).min(620.0);
+                let pad = ((ui.available_width() - w) / 2.0).max(16.0);
+                ui.add_space(56.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    ui.vertical(|ui| {
+                        ui.set_width(w);
+                        ui.label(RichText::new("redline").color(BRAND).strong().size(30.0));
+                        ui.label(RichText::new("Review the suggestions of an AI on your documents. You decide on each one.").color(MUTED).size(15.0));
+                        ui.add_space(22.0);
+                        if let Some(e) = &self.error {
+                            ui.label(RichText::new(e).color(DEL));
+                            ui.add_space(8.0);
+                        }
+                        ui.label(RichText::new("Your documents").color(STRONG).size(17.0));
+                        ui.add_space(6.0);
+                        if self.docs.is_empty() {
+                            ui.label(RichText::new("There are no documents yet.").color(MUTED));
+                        }
+                        for p in &self.docs {
+                            let resp = Frame::new()
+                                .fill(PAPER)
+                                .stroke(Stroke::new(1.0, RULE))
+                                .corner_radius(8.0)
+                                .inner_margin(Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                    ui.label(RichText::new(name).color(STRONG).size(15.5));
+                                    ui.label(RichText::new(p.display().to_string()).color(MUTED).size(12.0));
+                                })
+                                .response;
+                            if resp.interact(Sense::click()).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                *go = Some(Go::Open(p.clone()));
+                            }
+                            ui.add_space(8.0);
+                        }
+                        ui.add_space(18.0);
+                        ui.label(RichText::new("New document").color(STRONG).size(17.0));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("Name, for example: Checkout spec").desired_width(320.0));
+                            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                            let click = ui.add(egui::Button::new(RichText::new("Create").color(PAPER)).fill(LINK)).clicked();
+                            if (click || enter) && !self.name.trim().is_empty() {
+                                *go = Some(Go::Open(new_path(&self.name)));
+                                self.name.clear();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("The app saves it as a Markdown file in your Documents folder.\nTo open a file that is not in the list, drop it on this window.").color(MUTED).size(12.5));
+                    });
+                });
+            });
+        });
+    }
+}
+
+impl eframe::App for Root {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let mut go = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).find(|p| !p.as_os_str().is_empty())).map(Go::Open);
+        match &mut self.app {
+            Some(app) => {
+                if app.frame(ui) {
+                    go = Some(Go::Home);
+                }
+            }
+            None => self.start(ui, &mut go),
+        }
+        match go {
+            Some(Go::Home) => {
+                if let Some(mut app) = self.app.take() {
+                    app.commit();
+                }
+                self.docs = tracked_docs();
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title("redline".into()));
+            }
+            Some(Go::Open(p)) => {
+                if let Some(app) = &mut self.app {
+                    app.commit();
+                }
+                match open_doc(&p) {
+                    Ok(s) => {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title(&s.store.doc)));
+                        self.app = Some(App::new(s));
+                        self.error = None;
+                    }
+                    Err(e) => match &mut self.app {
+                        Some(app) => app.fail(e),
+                        None => self.error = Some(format!("{e:#}")),
+                    },
+                }
+            }
+            None => {}
+        }
+    }
+}
+
 impl App {
+    fn new(s: Session) -> Self {
+        let seen_max = s.state.threads.iter().map(|t| t.id).max().unwrap_or(0);
+        let mut app = App {
+            s,
+            marks: (0, vec![], vec![]),
+            active: None,
+            view: String::new(),
+            view0: String::new(),
+            segs: vec![],
+            buf: String::new(),
+            typed: Instant::now(),
+            sel: 0..0,
+            suggest: false,
+            focus: true,
+            composer: None,
+            reply: None,
+            reject: None,
+            modify: None,
+            tab: Tab::Comments,
+            flash: None,
+            reveal: (false, false),
+            last_poll: Instant::now(),
+            seen_max,
+        };
+        app.refresh();
+        app
+    }
+
     // ── state ────────────────────────────────────────────────────────────
 
     fn say(&mut self, m: impl Into<String>) {
@@ -224,6 +596,8 @@ impl App {
         let doc = &self.s.doc;
         let mut marks: Vec<Mark> = vec![];
         let mut places = vec![];
+        // new text of the suggestions: (place in the document, text, thread)
+        let mut adds: Vec<(usize, String, u64)> = vec![];
         let lines = |m: &Range<usize>| anchor::line_of(doc, m.start)..=anchor::line_of(doc, m.end);
         for (t, r) in self.s.open_threads() {
             places.push((t.id, r.as_ref().map(|r| anchor::line_of(doc, r.start))));
@@ -232,7 +606,8 @@ impl App {
                 Kind::Insert => {
                     let gap = if t.tight { "" } else { "\n" };
                     let text = if t.quote.is_empty() { format!("{}\n{gap}", t.new) } else { format!("\n{gap}{}", t.new) };
-                    marks.push(Mark { id: t.id, kind: t.kind, range: r.end..r.end, inject: Some((r.end, text)), tint: 0 });
+                    adds.push((r.end, text, t.id));
+                    marks.push(Mark { id: t.id, kind: t.kind, range: r, tint: 0 });
                 }
                 Kind::Comment => {
                     let mine = lines(&r);
@@ -246,18 +621,30 @@ impl App {
                         .map(|m| m.tint)
                         .collect();
                     let tint = (0..TINTS.len()).find(|c| !used.contains(c)).unwrap_or(marks.len() % TINTS.len());
-                    marks.push(Mark { id: t.id, kind: t.kind, range: r, inject: None, tint });
+                    marks.push(Mark { id: t.id, kind: t.kind, range: r, tint });
                 }
                 _ => {
-                    let clash = marks.iter().any(|m| m.kind != Kind::Comment && m.range.start < r.end && r.start < m.range.end);
-                    if !clash {
-                        let inject = (t.kind == Kind::Edit).then(|| (r.end, t.new.clone()));
-                        marks.push(Mark { id: t.id, kind: t.kind, range: r, inject, tint: 0 });
+                    if t.kind == Kind::Edit && !t.new.is_empty() {
+                        adds.push((r.end, t.new.clone(), t.id));
                     }
+                    marks.push(Mark { id: t.id, kind: t.kind, range: r, tint: 0 });
                 }
             }
         }
+        adds.sort_by_key(|a| a.0);
+        let (mut view, mut segs, mut from) = (String::new(), vec![], 0);
+        for (at, text, id) in adds {
+            view.push_str(&doc[from..at]);
+            segs.push((view.len()..view.len() + text.len(), id));
+            view.push_str(&text);
+            from = at;
+        }
+        view.push_str(&doc[from..]);
+        self.view0 = view.clone();
+        self.view = view;
+        self.segs = segs;
         self.marks = (self.s.version, marks, places);
+        self.buf = self.s.doc.clone();
         if self.active.is_some_and(|a| !self.marks.2.iter().any(|p| p.0 == a)) {
             self.active = None;
         }
@@ -267,315 +654,174 @@ impl App {
         self.s.state.threads.iter().find(|t| t.id == id)
     }
 
-    /// Save the paragraph that the person edits.
+    /// Save the text that the person typed. In the suggestion mode the
+    /// change becomes a suggestion and the text goes back.
     fn commit(&mut self) {
-        let Some(ed) = self.editing.take() else { return };
-        let text = ed.text.trim_end().to_string();
-        if text == ed.initial {
+        let Some((old, new)) = diff(&self.s.doc, &self.buf) else { return };
+        if !self.suggest {
+            let text = self.buf[new].to_string();
+            if let Err(e) = self.s.edit(old, &text, "edit") {
+                // The file changed in a different program: show that text.
+                let _ = self.s.poll();
+                self.marks.0 = 0;
+                self.refresh();
+                self.fail(e);
+            } else {
+                self.refresh();
+            }
             return;
         }
-        let doc = &self.s.doc;
-        let r = match ed.new_after {
-            Some(after) => {
-                if text.trim().is_empty() {
-                    return;
-                }
-                let (r, t) = anchor::block_insert(doc, after, &text);
-                self.s.edit(r, &t, "new")
+        let doc = self.s.doc.clone();
+        if doc.trim().is_empty() {
+            let r = self.s.propose(Kind::Insert, String::new(), 0, 0, self.buf.trim().to_string()).map(|_| ());
+            return self.done(r, "Suggestion added");
+        }
+        // A suggestion is about full words: grow the change to word borders.
+        let word = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
+        let (mut a, mut b) = (old.start, old.end);
+        let (mut na, mut nb) = (new.start, new.end);
+        let grow_left = |a: &mut usize, na: &mut usize, f: &dyn Fn(char) -> bool| {
+            while let Some(c) = doc[..*a].chars().next_back().filter(|c| f(*c)) {
+                *a -= c.len_utf8();
+                *na -= c.len_utf8();
             }
-            None if text.trim().is_empty() => {
-                let (l0, l1) = (anchor::line_of(doc, ed.range.start), anchor::line_of(doc, ed.range.end));
-                let (r, t) = anchor::delete_lines(doc, l0, l1);
-                self.s.edit(r, &t, "delete")
-            }
-            None => self.s.edit(ed.range, &text, "edit"),
         };
-        self.done(r, "Saved");
+        let grow_right = |b: &mut usize, nb: &mut usize, f: &dyn Fn(char) -> bool| {
+            while let Some(c) = doc[*b..].chars().next().filter(|c| f(*c)) {
+                *b += c.len_utf8();
+                *nb += c.len_utf8();
+            }
+        };
+        grow_left(&mut a, &mut na, &word);
+        grow_right(&mut b, &mut nb, &word);
+        if doc[a..b].trim().is_empty() {
+            // New text between words: attach it to the word before it, or after it.
+            grow_left(&mut a, &mut na, &|c| !word(c) && c != '\n');
+            grow_left(&mut a, &mut na, &word);
+            if doc[a..b].trim().is_empty() {
+                grow_left(&mut a, &mut na, &|c| !word(c));
+                grow_left(&mut a, &mut na, &word);
+            }
+            if doc[a..b].trim().is_empty() {
+                grow_right(&mut b, &mut nb, &|c| !word(c));
+                grow_right(&mut b, &mut nb, &word);
+            }
+        }
+        let (quote, text) = (doc[a..b].to_string(), self.buf[na..nb].to_string());
+        let (line, col) = anchor::pos(&doc, a);
+        let kind = if text.trim().is_empty() { Kind::Delete } else { Kind::Edit };
+        match self.s.propose(kind, quote, line, col, if kind == Kind::Delete { String::new() } else { text }) {
+            Ok(id) => {
+                self.seen_max = self.seen_max.max(id);
+                self.refresh();
+                self.active = Some(id);
+                self.reveal.1 = true;
+                self.tab = Tab::Comments;
+                self.say("Suggestion added. The text does not change until a person accepts it.");
+            }
+            Err(e) => {
+                self.buf = self.s.doc.clone();
+                self.view = self.view0.clone();
+                self.fail(e);
+            }
+        }
     }
 
-    /// Start a comment on the selected words, or on the full paragraph.
-    fn start_comment(&mut self) {
-        let Some(ed) = &self.editing else {
-            return self.say("Click in a paragraph first. Select words to comment on only those words.");
-        };
-        if ed.new_after.is_some() {
-            return self.say("Finish the new paragraph first.");
+    /// The place in the document of a place in `view0`.
+    fn to_doc(&self, x: usize) -> usize {
+        let mut out = x;
+        for (r, _) in &self.segs {
+            if r.end <= x {
+                out -= r.len();
+            } else if r.start < x {
+                out -= x - r.start;
+            }
         }
-        let text = ed.text.trim_end();
-        let sel = ed.sel.clone().filter(|s| !s.is_empty() && s.end <= text.len());
-        let (a, b) = sel.map(|s| (s.start, s.end)).unwrap_or((0, text.len()));
-        let quote = text[a..b].trim_matches('\n').to_string();
-        if quote.trim().is_empty() {
+        out
+    }
+
+    /// The place in `view0` of a place in the document. `end`: the place
+    /// is the end of a range, so new text at that place comes after it.
+    fn to_view(&self, x: usize, end: bool) -> usize {
+        let mut out = x;
+        for (r, _) in &self.segs {
+            let at = self.to_doc(r.start);
+            if at < x || (at == x && !end) {
+                out += r.len();
+            }
+        }
+        out
+    }
+
+    /// Start a comment on the selected words, or on the paragraph at the
+    /// text cursor.
+    fn start_comment(&mut self) {
+        self.commit();
+        let doc = &self.s.doc;
+        let ok = |i: usize| i <= doc.len() && doc.is_char_boundary(i);
+        let (mut a, mut b) = (self.to_doc(self.sel.start.min(self.view0.len())), self.to_doc(self.sel.end.min(self.view0.len())));
+        if !ok(a) || !ok(b) {
+            (a, b) = (doc.len(), doc.len());
+        }
+        if a == b {
+            let line = anchor::line_of(doc, a);
+            match anchor::blocks(doc).into_iter().find(|(l0, l1)| (*l0..=*l1).contains(&line)) {
+                Some((l0, l1)) => {
+                    let r = anchor::lines_range(doc, l0, l1);
+                    (a, b) = (r.start, r.end);
+                }
+                None => return self.say("Click in a paragraph first. Select words to comment on only those words."),
+            }
+        }
+        let raw = &doc[a..b];
+        let quote = raw.trim().to_string();
+        if quote.is_empty() {
             return self.say("There is no text to comment on.");
         }
-        let start = ed.range.start + a + (text[a..b].len() - text[a..b].trim_start_matches('\n').len());
-        self.commit();
-        let (line, col) = anchor::pos(&self.s.doc, start);
+        let start = a + (raw.len() - raw.trim_start().len());
+        let (line, col) = anchor::pos(doc, start);
         self.tab = Tab::Comments;
         self.composer = Some(Composer { quote, line, col, text: String::new(), focus: true });
     }
 
-    fn act(&mut self, a: Act) {
-        match a {
-            Act::Commit => self.commit(),
-            Act::Comment => self.start_comment(),
-            Act::Edit(range, place) => {
-                self.commit();
-                // The commit can move the text: find the paragraph at the click again.
-                let doc = &self.s.doc;
-                let range = if range.end <= doc.len() && doc.is_char_boundary(range.start) && doc.is_char_boundary(range.end) {
-                    range
-                } else {
-                    return;
-                };
-                let text = doc[range.clone()].to_string();
-                let line = anchor::line_of(doc, range.start);
-                let end = anchor::line_of(doc, range.end);
-                if let Some(m) = self.marks.1.iter().find(|m| {
-                    let l = anchor::line_of(doc, m.range.start);
-                    (line..=end).contains(&l)
-                }) {
-                    self.active = Some(m.id);
-                    self.reveal.1 = true;
-                }
-                self.editing = Some(Editing { range, new_after: None, initial: text.clone(), text, place, focus: true, sel: None });
-            }
-            Act::New(after) => {
-                self.commit();
-                let at = match after {
-                    Some(l) => anchor::lines_range(&self.s.doc, l, l).end,
-                    None => 0,
-                };
-                self.editing = Some(Editing {
-                    range: at..at,
-                    new_after: Some(after),
-                    text: String::new(),
-                    initial: String::new(),
-                    place: None,
-                    focus: true,
-                    sel: None,
-                });
-            }
-        }
-    }
-
     // ── the page ─────────────────────────────────────────────────────────
 
-    /// Add one source line to `job` as formatted text. Markdown marks are
-    /// not shown: a heading is large text, a list item gets a bullet.
-    fn add_line(&self, job: &mut LayoutJob, r: &Range<usize>, fence: &mut bool) {
-        let doc = &self.s.doc;
-        let text = &doc[r.clone()];
-        let t = text.trim_start();
-        let indent = text.len() - t.len();
-        let is_fence = t.starts_with("```") || t.starts_with("~~~");
-        let code_line = *fence || is_fence;
-        if is_fence {
-            *fence = !*fence;
-        }
-        let hashes = t.chars().take_while(|c| *c == '#').count();
-        let heading = !code_line && (1..=6).contains(&hashes) && t[hashes..].starts_with(' ');
-        let mut skip = r.start;
-        let base = if code_line {
-            TextFormat { font_id: mono(13.5), color: if is_fence { MUTED } else { INK }, background: CODE_BG, ..Default::default() }
-        } else if heading {
-            skip = r.start + indent + hashes + 1;
-            let size = match hashes {
-                1 => 30.0,
-                2 => 22.0,
-                _ => 18.0,
-            };
-            TextFormat { font_id: body(size), color: STRONG, ..Default::default() }
-        } else if t.starts_with('>') {
-            skip = r.start + indent + 1 + t[1..].starts_with(' ') as usize;
-            TextFormat { font_id: body(16.0), color: MUTED, italics: true, ..Default::default() }
-        } else {
-            TextFormat { font_id: body(16.0), color: INK, line_height: Some(25.0), ..Default::default() }
-        };
-        if !code_line && !heading {
-            let tb = t.as_bytes();
-            if tb.len() >= 2 && matches!(tb[0], b'-' | b'*' | b'+') && tb[1] == b' ' {
-                skip = r.start + indent + 2;
-                let rest = &t[2..];
-                // A task item keeps its box: the bullet goes away.
-                let bullet = if rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ") { "" } else { "•  " };
-                job.append(&format!("{}  {bullet}", &text[..indent]), 0.0, TextFormat { color: BRAND, ..base.clone() });
-            }
-        }
-
-        let here: Vec<&Mark> = self.marks.1.iter().filter(|m| m.range.start <= r.end && r.start <= m.range.end).collect();
-        let mut cuts: Vec<usize> = vec![r.start, r.end];
-        for m in &here {
-            cuts.push(m.range.start.clamp(r.start, r.end));
-            cuts.push(m.range.end.clamp(r.start, r.end));
-        }
-        cuts.sort();
-        cuts.dedup();
-        let inject = |job: &mut LayoutJob, at: usize| {
-            for m in &here {
-                if let Some((pos, new)) = &m.inject {
-                    if *pos == at {
-                        let on = self.active == Some(m.id);
-                        let f = TextFormat {
-                            font_id: if new.contains('\n') { body(16.0) } else { base.font_id.clone() },
-                            color: ADD,
-                            background: if on { ADD_BG_ON } else { ADD_BG },
-                            line_height: base.line_height,
-                            ..Default::default()
-                        };
-                        // show list items of the new text with a bullet, as on the page
-                        let shown: Vec<String> = new
-                            .split('\n')
-                            .map(|l| match l.strip_prefix("- ").or(l.strip_prefix("* ")) {
-                                Some(rest) => format!("  •  {rest}"),
-                                None => l.to_string(),
-                            })
-                            .collect();
-                        job.append(&shown.join("\n"), 0.0, f);
-                    }
-                }
-            }
-        };
-        let (mut in_code, mut strong) = (false, false);
-        for w in cuts.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            inject(job, a);
-            let a = a.max(skip);
-            if a >= b {
-                continue;
-            }
-            let mut f = base.clone();
-            // a suggestion wins over a comment on the same text
-            let cover = |k: fn(Kind) -> bool| here.iter().find(|m| k(m.kind) && m.range.start <= a && b <= m.range.end && !m.range.is_empty());
-            if let Some(m) = cover(|k| k != Kind::Comment) {
-                f.color = DEL;
-                f.strikethrough = Stroke::new(1.0, DEL);
-                f.background = if self.active == Some(m.id) { DEL_BG_ON } else { DEL_BG };
-            } else if let Some(m) = cover(|k| k == Kind::Comment) {
-                let (normal, on) = TINTS[m.tint];
-                f.background = if self.active == Some(m.id) { on } else { normal };
-            }
-            if code_line {
-                job.append(&doc[a..b], 0.0, f);
-                continue;
-            }
-            // `code` and **strong**, with the marks hidden
-            for (i, part) in doc[a..b].split('`').enumerate() {
-                if i > 0 {
-                    in_code = !in_code;
-                }
-                if in_code {
-                    let mut pf = f.clone();
-                    pf.font_id = mono(base.font_id.size * 0.88);
-                    if pf.background == Color32::TRANSPARENT {
-                        pf.background = CODE_BG;
-                    }
-                    job.append(part, 0.0, pf);
-                    continue;
-                }
-                for (j, piece) in part.split("**").enumerate() {
-                    if j > 0 {
-                        strong = !strong;
-                    }
-                    let mut pf = f.clone();
-                    if strong && pf.color == INK {
-                        pf.color = STRONG;
-                        pf.underline = Stroke::new(0.0, STRONG);
-                    }
-                    job.append(piece, 0.0, pf);
-                }
-            }
-        }
-        inject(job, r.end);
-    }
-
-    fn block_job(&self, l0: usize, l1: usize, width: f32) -> LayoutJob {
-        let mut job = LayoutJob::default();
-        job.wrap.max_width = width;
-        let mut fence = false;
-        for l in l0..=l1 {
-            let r = anchor::lines_range(&self.s.doc, l, l);
-            self.add_line(&mut job, &r, &mut fence);
-            if l < l1 {
-                job.append("\n", 0.0, TextFormat { font_id: body(16.0), ..Default::default() });
-            }
-        }
-        if job.text.is_empty() {
-            job.append(" ", 0.0, TextFormat::default());
-        }
-        job
-    }
-
-    /// The text box for the paragraph that the person edits.
-    fn editor(&mut self, ui: &mut egui::Ui, width: f32, acts: &mut Vec<Act>) {
-        let Some(ed) = &mut self.editing else { return };
-        let code = ed.text.trim_start().starts_with("```");
-        let out = Frame::new()
-            .fill(EDIT_BG)
-            .stroke(Stroke::new(1.0, LINK))
-            .corner_radius(6.0)
-            .inner_margin(Margin::symmetric(10, 8))
-            .outer_margin(Margin { left: -11, right: -11, top: -4, bottom: 0 })
-            .show(ui, |ui| {
-                egui::TextEdit::multiline(&mut ed.text)
-                    .font(if code { mono(13.5) } else { body(16.0) })
-                    .frame(Frame::NONE)
-                    .desired_width(width)
-                    .desired_rows(1)
-                    .hint_text("Write here…")
-                    .show(ui)
+    /// The threads at their place in the text on the page. The place moves
+    /// with the text that the person typed and that is not saved yet.
+    fn shown(&self) -> Vec<(u64, Shown)> {
+        let mut base: Vec<(u64, Shown)> = self
+            .marks
+            .1
+            .iter()
+            .map(|m| {
+                let r = self.to_view(m.range.start, false)..self.to_view(m.range.end, true);
+                (m.id, (r, Paint::Thread(m.kind), m.tint, self.active == Some(m.id)))
             })
-            .inner;
-        let mut out = out;
-        if ed.focus {
-            ed.focus = false;
-            out.response.request_focus();
-            if let Some(p) = ed.place.take() {
-                let c = out.galley.cursor_from_pos(p - out.galley_pos);
-                out.state.cursor.set_char_range(Some(CCursorRange::one(c)));
-            } else {
-                let end = CCursor::new(ed.text.chars().count());
-                out.state.cursor.set_char_range(Some(CCursorRange::one(end)));
-            }
-            out.state.clone().store(ui.ctx(), out.response.id);
-        }
-        // Keep the selection when the box loses the focus: the person then
-        // clicks a button that needs it.
-        let cur = out.state.cursor.char_range().map(|c| {
-            let r = c.as_sorted_char_range();
-            let byte = |ci: usize| ed.text.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(ed.text.len());
-            byte(r.start.0)..byte(r.end.0)
-        });
-        if cur.as_ref().is_some_and(|c| !c.is_empty()) || out.response.has_focus() {
-            ed.sel = cur;
-        }
-        let has_sel = ed.sel.as_ref().is_some_and(|s| !s.is_empty());
-        let is_new = ed.new_after.is_some();
-        let row = ui
-            .horizontal(|ui| {
-                if ui.add(egui::Button::new(RichText::new("Done").color(PAPER)).fill(LINK)).clicked() {
-                    acts.push(Act::Commit);
-                }
-                if !is_new {
-                    let label = if has_sel { "Comment on selection" } else { "Comment on paragraph" };
-                    if ui.button(label).clicked() {
-                        acts.push(Act::Comment);
+            .collect();
+        base.extend(self.segs.iter().map(|(r, id)| (*id, (r.clone(), Paint::New, 0, self.active == Some(*id)))));
+        let change = diff(&self.view0, &self.view);
+        base.into_iter()
+            .filter_map(|(id, (r, paint, tint, on))| {
+                let r = match &change {
+                    None => r,
+                    Some((old, _)) if r.end <= old.start => r,
+                    Some((old, new)) if r.start >= old.end => {
+                        let by = new.end as isize - old.end as isize;
+                        (r.start as isize + by) as usize..(r.end as isize + by) as usize
                     }
-                }
-                ui.label(RichText::new("Changes save when you click outside the box.").color(MUTED).size(12.5));
+                    _ => return None,
+                };
+                Some((id, (r, paint, tint, on)))
             })
-            .response;
-        // A click outside the box and its buttons ends the edit.
-        let over_row = ui.rect_contains_pointer(row.rect.expand(6.0));
-        if out.response.lost_focus() && !over_row && acts.is_empty() {
-            acts.push(Act::Commit);
-        }
+            .collect()
     }
 
     fn page(&mut self, ui: &mut egui::Ui) {
-        let mut acts: Vec<Act> = vec![];
-        let blocks = anchor::blocks(&self.s.doc);
-        let reveal_line = self.reveal.0.then(|| self.active).flatten().and_then(|a| self.marks.2.iter().find(|p| p.0 == a).and_then(|p| p.1));
+        let shown = self.shown();
+        let styles: Vec<Shown> = shown.iter().map(|s| s.1.clone()).collect();
+        let reveal = self.reveal.0.then_some(self.active).flatten().and_then(|a| shown.iter().find(|s| s.0 == a)).map(|s| s.1.0.start);
+        let mut changed = false;
+        let mut lost_focus = false;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let page_w = (ui.available_width() - 64.0).clamp(320.0, 820.0);
             let pad = ((ui.available_width() - page_w) / 2.0).max(16.0);
@@ -588,58 +834,90 @@ impl App {
                     .corner_radius(8.0)
                     .inner_margin(Margin { left: 56, right: 56, top: 48, bottom: 56 })
                     .show(ui, |ui| {
-                      ui.vertical(|ui| {
                         let width = page_w - 112.0;
                         ui.set_width(width);
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let new_at = self.editing.as_ref().and_then(|e| e.new_after);
-                        if new_at == Some(None) {
-                            self.editor(ui, width, &mut acts);
-                            ui.add_space(14.0);
+                        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+                            let mut job = style_doc(text.as_str(), &styles);
+                            job.wrap.max_width = wrap;
+                            ui.fonts_mut(|f| f.layout_job(job))
+                        };
+                        let id = egui::Id::unique("page");
+                        let out = egui::TextEdit::multiline(&mut self.view)
+                            .id(id)
+                            .frame(Frame::NONE)
+                            .desired_width(width)
+                            .desired_rows(16)
+                            .hint_text(RichText::new("Write here…").color(PALE).size(16.0))
+                            .layouter(&mut layouter)
+                            .show(ui);
+                        changed = out.response.changed();
+                        lost_focus = out.response.lost_focus();
+                        if self.focus {
+                            self.focus = false;
+                            out.response.request_focus();
                         }
-                        for (l0, l1) in &blocks {
-                            let range = anchor::lines_range(&self.s.doc, *l0, *l1);
-                            let editing_this = self.editing.as_ref().is_some_and(|e| e.new_after.is_none() && e.range == range);
-                            if editing_this {
-                                self.editor(ui, width, &mut acts);
-                            } else {
-                                let resp = ui
-                                    .add(egui::Label::new(self.block_job(*l0, *l1, width)).selectable(false).sense(Sense::click()))
-                                    .on_hover_cursor(CursorIcon::Text);
-                                if resp.clicked() {
-                                    acts.push(Act::Edit(range.clone(), resp.interact_pointer_pos()));
+                        // the selection, and the thread at the text cursor
+                        if let Some(c) = out.cursor_range {
+                            let r = c.as_sorted_char_range();
+                            let sel = byte_of(&self.view, r.start.0)..byte_of(&self.view, r.end.0);
+                            if sel != self.sel && sel.is_empty() && !changed {
+                                let at = sel.start;
+                                let hit = shown.iter().filter(|s| s.1.0.start <= at && at <= s.1.0.end).min_by_key(|s| s.1.0.len());
+                                if let Some(h) = hit {
+                                    if self.active != Some(h.0) {
+                                        self.active = Some(h.0);
+                                        self.reveal.1 = true;
+                                        self.tab = Tab::Comments;
+                                    }
                                 }
-                                if reveal_line.is_some_and(|l| (*l0..=*l1).contains(&l)) {
-                                    resp.scroll_to_me(Some(Align::Center));
-                                }
                             }
-                            if new_at == Some(Some(*l1)) {
-                                ui.add_space(14.0);
-                                self.editor(ui, width, &mut acts);
-                            }
-                            ui.add_space(14.0);
+                            self.sel = sel;
                         }
-                        ui.add_space(6.0);
-                        let last = blocks.last().map(|b| b.1);
-                        if self.editing.is_none() {
-                            let hint = if blocks.is_empty() { "Click here to start to write" } else { "+ Add a paragraph" };
-                            let resp = ui
-                                .add(egui::Label::new(RichText::new(hint).color(MUTED).size(15.0)).selectable(false).sense(Sense::click()))
-                                .on_hover_cursor(CursorIcon::PointingHand);
-                            if resp.clicked() {
-                                acts.push(Act::New(last));
+                        // a click on a card: go to its text
+                        if let Some(at) = reveal {
+                            let c = CCursor::new(char_of(&self.view, at));
+                            let rect = out.galley.pos_from_cursor(c).translate(out.galley_pos.to_vec2());
+                            ui.scroll_to_rect(rect.expand(60.0), Some(Align::Center));
+                            if let Some(mut state) = TextEditState::load(ui.ctx(), id) {
+                                state.cursor.set_char_range(Some(CCursorRange::one(c)));
+                                state.store(ui.ctx(), id);
                             }
+                            self.sel = at..at;
                         }
-                      });
                     });
             });
             ui.add_space(48.0);
         });
         self.reveal.0 = false;
-        // A comment starts before the commit: it needs the selection.
-        acts.sort_by_key(|a| !matches!(a, Act::Comment));
-        if let Some(a) = acts.into_iter().next() {
-            self.act(a);
+        if changed {
+            self.typed = Instant::now();
+        }
+        // The change that the person typed, as a change of the document.
+        match diff(&self.view0, &self.view) {
+            None => {
+                if self.buf != self.s.doc {
+                    self.buf = self.s.doc.clone();
+                }
+            }
+            Some((old, new)) => {
+                let in_new_text = self.segs.iter().any(|(r, _)| {
+                    if old.is_empty() { r.start < old.start && old.start < r.end } else { old.start < r.end && r.start < old.end }
+                });
+                if in_new_text {
+                    self.view = self.view0.clone();
+                    self.buf = self.s.doc.clone();
+                    self.say("The green text is a suggestion. Press Change on its card to change it.");
+                } else {
+                    let (a, b) = (self.to_doc(old.start), self.to_doc(old.end));
+                    self.buf = format!("{}{}{}", &self.s.doc[..a], &self.view[new], &self.s.doc[b..]);
+                }
+            }
+        }
+        // Save when the person stops. A suggestion waits longer: one burst
+        // of keys is one suggestion.
+        let wait = Duration::from_millis(if self.suggest { 1600 } else { 700 });
+        if self.buf != self.s.doc && (lost_focus || self.typed.elapsed() > wait) {
+            self.commit();
         }
     }
 
@@ -662,7 +940,9 @@ impl App {
     fn card(&mut self, ui: &mut egui::Ui, t: &Thread, line: Option<usize>) {
         let on = self.active == Some(t.id);
         let (label, color) = kind_label(t.kind);
-        let resp = Frame::new()
+        // The card senses a click first, then its content: a button in the
+        // card gets its click, and a click on the rest selects the card.
+        let resp = ui.scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| { Frame::new()
             .fill(if on { CARD_ON } else { PAPER })
             .stroke(Stroke::new(1.0, if on { Color32::from_rgb(232, 200, 110) } else { RULE }))
             .corner_radius(8.0)
@@ -752,6 +1032,25 @@ impl App {
                             self.reject = None;
                         }
                     });
+                } else if self.modify.as_ref().is_some_and(|m| m.0 == t.id) {
+                    let text = &mut self.modify.as_mut().unwrap().1;
+                    ui.label(RichText::new("Change the suggested text. Then accept it.").color(MUTED).size(12.5));
+                    ui.add(egui::TextEdit::multiline(text).desired_rows(3).desired_width(f32::INFINITY));
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Accept with changes").color(PAPER)).fill(ADD)).clicked() {
+                            let (id, new) = self.modify.take().unwrap();
+                            self.commit();
+                            match self.s.accept(id, Some(new)) {
+                                Ok(_) => {
+                                    self.refresh();
+                                    self.say("Suggestion accepted with your changes. Undo reverses it.");
+                                }
+                                Err(e) => self.fail(e),
+                            }
+                        } else if ui.button("Cancel").clicked() {
+                            self.modify = None;
+                        }
+                    });
                 } else {
                     ui.horizontal(|ui| {
                         if t.kind.is_proposal() {
@@ -765,9 +1064,13 @@ impl App {
                                     Err(e) => self.fail(e),
                                 }
                             }
+                            if t.kind != Kind::Delete && ui.button("Change").on_hover_text("Change the suggested text, then accept it").clicked() {
+                                self.modify = Some((t.id, t.new.clone()));
+                                (self.reply, self.reject) = (None, None);
+                            }
                             if ui.button("Reject").clicked() {
                                 self.reject = Some((t.id, String::new()));
-                                self.reply = None;
+                                (self.reply, self.modify) = (None, None);
                             }
                         } else if ui.button("Resolve").clicked() {
                             let r = self.s.resolve(t.id);
@@ -775,26 +1078,83 @@ impl App {
                         }
                         if ui.button("Reply").clicked() {
                             self.reply = Some((t.id, String::new()));
-                            self.reject = None;
+                            (self.reject, self.modify) = (None, None);
                         }
                     });
                 }
-            })
+            }); })
             .response;
         if on && self.reveal.1 {
             resp.scroll_to_me(None);
         }
-        if resp.interact(Sense::click()).clicked() {
+        if resp.clicked() {
             self.active = Some(t.id);
             self.reveal.0 = true;
         }
+    }
+
+    /// A thread that is not open: what the decision was, and who made it.
+    fn closed_card(&mut self, ui: &mut egui::Ui, t: &Thread) {
+        let (label, color) = kind_label(t.kind);
+        Frame::new().fill(PAPER).stroke(Stroke::new(1.0, RULE)).corner_radius(8.0).inner_margin(Margin::same(12)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| Self::person(ui, &t.author, t.agent));
+            ui.label(RichText::new(label).color(color).size(12.0));
+            let clip = |s: &str| -> String {
+                let v: Vec<&str> = s.lines().collect();
+                if v.len() <= 3 { s.to_string() } else { format!("{} …", v[..3].join("\n")) }
+            };
+            match t.kind {
+                Kind::Comment => {
+                    ui.label(RichText::new(format!("“{}”", clip(&t.quote))).color(MUTED).italics().size(13.0));
+                }
+                _ => {
+                    if t.kind != Kind::Insert {
+                        ui.label(RichText::new(clip(&t.quote)).color(DEL).strikethrough().background_color(DEL_BG));
+                    }
+                    if t.kind != Kind::Delete {
+                        ui.label(RichText::new(clip(&t.new)).color(ADD).background_color(ADD_BG));
+                    }
+                }
+            }
+            if !t.body.is_empty() {
+                ui.label(RichText::new(clip(&t.body)).color(INK));
+            }
+            for r in &t.replies {
+                ui.separator();
+                ui.horizontal(|ui| Self::person(ui, &r.author, r.agent));
+                ui.label(&r.body);
+            }
+            ui.add_space(4.0);
+            let (word, c) = match t.status {
+                Status::Accepted => ("Accepted", ADD),
+                Status::Rejected => ("Rejected", DEL),
+                _ => ("Resolved", MUTED),
+            };
+            let by = t.decided_by.as_deref().map(|b| format!(" by {b}")).unwrap_or_default();
+            let when = t.decided_at.map(ago).map(|w| if w == "now" { ", now".to_string() } else { format!(", {w} ago") }).unwrap_or_default();
+            ui.label(RichText::new(format!("{word}{by}{when}")).color(c).size(12.5));
+            if let Some(n) = t.note.as_ref().filter(|n| !n.is_empty()) {
+                ui.label(RichText::new(format!("Reason: {n}")).color(INK).size(13.0));
+            }
+            // An accepted suggestion is in the text: Undo reverses it.
+            if t.status != Status::Accepted && ui.button("Open again").clicked() {
+                let r = self.s.reopen(t.id);
+                self.done(r, "Thread opened again");
+                self.tab = Tab::Comments;
+                self.active = Some(t.id);
+                self.reveal = (true, true);
+            }
+        });
     }
 
     fn column(&mut self, ui: &mut egui::Ui) {
         ui.add_space(14.0);
         let open = self.marks.2.len();
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Comments, format!("Comments and suggestions ({open})"));
+            let closed = self.s.closed_threads().len();
+            ui.selectable_value(&mut self.tab, Tab::Comments, format!("To review ({open})"));
+            ui.selectable_value(&mut self.tab, Tab::Closed, format!("Closed ({closed})"));
             ui.selectable_value(&mut self.tab, Tab::Activity, "Activity");
         });
         ui.add_space(6.0);
@@ -802,6 +1162,19 @@ impl App {
             ui.set_width(ui.available_width() - 6.0);
             if self.tab == Tab::Activity {
                 return self.activity(ui);
+            }
+            if self.tab == Tab::Closed {
+                let closed: Vec<Thread> = self.s.closed_threads().into_iter().cloned().collect();
+                if closed.is_empty() {
+                    ui.add_space(18.0);
+                    ui.label(RichText::new("No decisions yet.").color(STRONG));
+                    ui.label(RichText::new("Accepted, rejected and resolved items show here.").color(MUTED));
+                }
+                for t in &closed {
+                    self.closed_card(ui, t);
+                    ui.add_space(8.0);
+                }
+                return;
             }
             if let Some(c) = &mut self.composer {
                 let mut done: Option<bool> = None;
@@ -891,11 +1264,14 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Live updates from the agent and from other front ends. Not during
-        // an edit: the text under the edit must not move.
-        if self.last_poll.elapsed() > Duration::from_millis(300) && self.editing.is_none() {
+impl App {
+    /// Draw the document window. Returns true when the person asks for the
+    /// list of documents.
+    fn frame(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut home = false;
+        // Live updates from the agent and from other front ends. Not while
+        // typed text waits for its save: that text must not move.
+        if self.last_poll.elapsed() > Duration::from_millis(300) && self.buf == self.s.doc {
             self.last_poll = Instant::now();
             match self.s.poll() {
                 Ok(true) => {
@@ -934,6 +1310,9 @@ impl eframe::App for App {
         egui::Panel::top("top").frame(bar).show_separator_line(false).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("redline").color(BRAND).strong().size(15.0));
+                if ui.button("Documents").on_hover_text("Go to the list of documents").clicked() {
+                    home = true;
+                }
                 let name = self.s.store.doc.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 ui.label(RichText::new(name).color(STRONG).size(17.0));
                 ui.add_space(12.0);
@@ -943,9 +1322,21 @@ impl eframe::App for App {
                 if ui.button("Comment").on_hover_text("Comment on the selected words, or on the paragraph (Ctrl+Alt+M)").clicked() || comment_key {
                     self.start_comment();
                 }
+                ui.add_space(12.0);
+                let mut mode = self.suggest;
+                ui.selectable_value(&mut mode, false, "Editing").on_hover_text("What you type changes the document");
+                ui.selectable_value(&mut mode, true, "Suggesting").on_hover_text("What you type becomes a suggestion. The document changes when a person accepts it");
+                if mode != self.suggest {
+                    self.commit();
+                    self.suggest = mode;
+                    self.focus = true;
+                }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| match &self.flash {
                     Some((m, _, err)) => {
                         ui.label(RichText::new(m).color(if *err { DEL } else { ADD }));
+                    }
+                    None if self.buf != self.s.doc => {
+                        ui.label(RichText::new(if self.suggest { "Suggesting…" } else { "Saving…" }).color(MUTED));
                     }
                     None => {
                         let open = self.marks.2.len();
@@ -977,5 +1368,6 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(Frame::new().fill(DESK)).show(ui, |ui| {
             self.page(ui);
         });
+        home
     }
 }

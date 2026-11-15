@@ -108,6 +108,26 @@ impl Session {
         })
     }
 
+    /// Open a rejected or resolved thread again.
+    pub fn reopen(&mut self, id: u64) -> Result<()> {
+        self.tx(|tx, me| {
+            let t = tx.state.thread(id)?;
+            if t.status == Status::Open {
+                bail!("#{id} is open");
+            }
+            let thread = t.eid.clone();
+            tx.log(me, What::Reopened { thread });
+            Ok(())
+        })
+    }
+
+    /// The threads that are not open, with the newest decision first.
+    pub fn closed_threads(&self) -> Vec<&Thread> {
+        let mut v: Vec<_> = self.state.threads.iter().filter(|t| t.status != Status::Open).collect();
+        v.sort_by_key(|t| std::cmp::Reverse(t.decided_at));
+        v
+    }
+
     pub fn reply(&mut self, id: u64, body: String) -> Result<()> {
         self.tx(|tx, me| {
             let thread = tx.state.thread(id)?.eid.clone();
@@ -120,6 +140,14 @@ impl Session {
     pub fn comment(&mut self, quote: String, line: usize, col: usize, body: String) -> Result<u64> {
         self.tx(|tx, me| {
             let eid = tx.log(me, What::Commented { line, col, quote, body });
+            Ok(crate::cli::num(&tx.state, &eid))
+        })
+    }
+
+    /// Suggest a change as the person of this session. Returns the thread number.
+    pub fn propose(&mut self, kind: crate::store::Kind, quote: String, line: usize, col: usize, new: String) -> Result<u64> {
+        self.tx(|tx, me| {
+            let eid = tx.log(me, What::Proposed { kind, line, col, quote, new, tight: false, why: String::new() });
             Ok(crate::cli::num(&tx.state, &eid))
         })
     }

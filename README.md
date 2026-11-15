@@ -116,23 +116,36 @@ popup_height = 84
 
 ```bash
 nix run github:zdcthomas/redline#redline-app -- spec.md
+nix run github:zdcthomas/redline#redline-app      # the start page
 ```
+
+With no file, the app shows a start page: the list of your documents and a
+box for a new document. A file that you drop on the window opens too.
 
 The app is for people who do not use a terminal. It looks and works like a
 document editor, with no modes and no key commands to learn:
 
-- **Read.** The spec shows as a page. Headings, lists and code show as
-  formatted text, not as Markdown marks.
-- **Write.** Click a paragraph: it becomes a text box in place. Click outside
-  the box, or press Done, to save. "Add a paragraph" is at the end of the page.
-- **Comment.** Click in a paragraph, select words if you want (a double-click
-  selects one word), then press Comment. The comment goes on the selected
-  words, or on the paragraph.
+- **Write.** The page is one text surface. Click and type. The app saves the
+  text when you stop. A heading is large, and a Markdown mark shows pale.
+- **Suggest.** Set the mode to "Suggesting" in the top bar. Then a change that
+  you type becomes a suggestion, and the text goes back. The document changes
+  when a person accepts the suggestion.
+- **Comment.** Select words (a double-click selects one word), then press
+  Comment. With no selection, the comment goes on the paragraph at the cursor.
 - **Review.** Each suggestion and comment is a card in the right column, with
   Accept, Reject, Reply and Resolve buttons. Reject asks for an optional
   reason, which the agent reads. A suggestion also shows in the text: removed
   text is red and struck through, added text is green.
-- **Activity.** The second tab of the column shows the history.
+- **Change, then accept.** "Change" on a suggestion opens its text in a box.
+  Change the text, then accept your version.
+- **Closed.** The second tab shows the accepted, rejected and resolved items,
+  with who decided and the reason. "Open again" puts an item back in review.
+- **Activity.** The third tab of the column shows the history.
+
+A link and *emphasis* show with their look, and a table shows in a
+fixed-width font. A suggestion shows on the page: the text that it removes is
+red and struck through, and its new text is green. The green text is not in
+the document, so you cannot type in it. "Change" on the card changes it.
 - **Undo.** The Undo button, or Ctrl+Z outside a text box.
 
 The app is in [app/](app/), written with egui. It shows new suggestions from
